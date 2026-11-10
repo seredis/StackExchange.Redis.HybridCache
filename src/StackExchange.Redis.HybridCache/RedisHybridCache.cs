@@ -20,16 +20,18 @@ namespace StackExchange.Redis.HybridCache;
 /// <para>
 /// Unlike the default <c>Microsoft.Extensions.Caching.Hybrid</c> implementation, there is no
 /// separate in-process L1: the multiplexer's client-side cache is the single near cache,
-/// holding the serialized payload and invalidated by server push. <c>RemoveAsync</c> is a
-/// delete (every process in the fleet drops its near copy), and <c>RemoveByTagAsync</c>
-/// writes the same per-tag invalidation-timestamp keys the default implementation uses in L2 —
-/// but because those keys are themselves client-side cached and push-invalidated, tag
-/// invalidation is coherent across the fleet rather than local-plus-eventual.
+/// holding the serialized payload and invalidated by server push. Entries are plain redis
+/// strings with absolute expiry (<c>SET ... PX</c>) — sliding expiration is deliberately
+/// unsupported, because a sliding read is a write in disguise and is broken under client-side
+/// caching either way. <c>RemoveAsync</c> is a delete (every process in the fleet drops its
+/// near copy), and <c>RemoveByTagAsync</c> writes a per-tag invalidation-timestamp key
+/// (<c>__SER_HCT__&lt;tag&gt;</c>) that is itself client-side cached and push-invalidated, so
+/// tag invalidation is coherent across the fleet rather than local-plus-eventual.
 /// </para>
 /// <para>
-/// Payloads and tag keys are wire-compatible with the default implementation over the redis
-/// <c>IDistributedCache</c>, given the same serializer configuration, so mixed fleets can share
-/// entries during migration. See <c>docs/design.md</c> for the architecture and phasing.
+/// The payload envelope is byte-compatible with the default implementation's
+/// (<c>HybridCachePayload</c>), given the same serializer configuration; the redis-level
+/// representation is not. See <c>docs/design.md</c> for the architecture and phasing.
 /// </para>
 /// </remarks>
 public sealed partial class RedisHybridCache : HybridCacheBase

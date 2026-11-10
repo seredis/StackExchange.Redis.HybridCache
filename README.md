@@ -13,9 +13,10 @@ tag invalidation never reach other servers' L1. Redis has had the missing mechan
 invalidation, while keeping the parts of the stock implementation worth keeping — the stampede
 protection (query combination), the serialization pipeline, and the `HybridCache` contract
 itself (from `Microsoft.Extensions.Caching.Abstractions`; swapping in this implementation is a
-one-line DI change). Payloads and tag keys stay wire-compatible with the default implementation
-over the redis `IDistributedCache` (given the same serializer configuration), so mixed fleets
-can share entries during migration.
+one-line DI change). Entries are plain redis strings with absolute expiry — sliding expiration
+is deliberately unsupported (it is incompatible with client-side caching; the design notes
+explain why) — and the payload envelope stays byte-compatible with the default implementation's,
+given the same serializer configuration.
 
 > **Status: skeleton.** The public shape and build exist; the implementation does not yet.
 > Start with [docs/design.md](docs/design.md) — architecture, the fork map from

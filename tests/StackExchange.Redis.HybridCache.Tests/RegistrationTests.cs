@@ -12,7 +12,7 @@ public class RegistrationTests
     public void OptionsHaveDocumentedDefaults()
     {
         var options = new RedisHybridCacheOptions();
-        Assert.Equal("", options.KeyPrefix);
+        Assert.Equal("hc:", options.KeyPrefix);
         Assert.Equal(1 << 20, options.MaximumPayloadBytes);
         Assert.Equal(1024, options.MaximumKeyLength);
     }
