@@ -17,6 +17,11 @@
 
     <!-- tests -->
     <PackageVersion Include="Microsoft.Extensions.DependencyInjection" Version="10.0.13" />
+    <!-- the REAL stock stack, for mixed-mode behaviour probes (deliberately not our packages;
+         note these bring a transitive StackExchange.Redis 2.x, isolated to that test project) -->
+    <PackageVersion Include="Microsoft.Extensions.Caching.Hybrid" Version="10.11.0" />
+    <PackageVersion Include="Microsoft.Extensions.Caching.StackExchangeRedis" Version="10.0.13" />
+    <PackageVersion Include="Microsoft.Extensions.Logging" Version="10.0.13" />
     <PackageVersion Include="xunit.v3" Version="4.0.2" />
     <PackageVersion Include="GitHubActionsTestLogger" Version="3.0.5" />
   </ItemGroup>

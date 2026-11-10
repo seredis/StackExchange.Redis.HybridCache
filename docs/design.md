@@ -225,6 +225,32 @@ separate prefix if cautious, let TTLs age out". What survives, because it is fre
    freshly flipped fleet starts warm from the old fleet's entries; writes are always native.
    One-directional by design — the old fleet is on its way out.
 
+### Mixed-mode behaviour (validated empirically, not just from source)
+
+Validated 2026-11-10 against the real shipped packages (`Microsoft.Extensions.Caching.Hybrid`
+10.11.0 + `Microsoft.Extensions.Caching.StackExchangeRedis` 10.0.13) and a live redis 8, in
+`tests/StackExchange.Redis.HybridCache.MixedMode.Tests` (that project deliberately references
+only the stock stack). Findings, all asserted by tests:
+
+- **Stock reading a native string entry**: the `HMGET` fails with `WRONGTYPE`;
+  `DefaultHybridCache` logs it (`CacheUnderlyingDataQueryFailure`, Error) and **treats it as a
+  miss** — the factory runs, nothing is surfaced to the caller. (Source: the L2 fetch's generic
+  `catch` sets `result = default` with the comment `// treat as "miss"`; only
+  `OperationCanceledException` propagates.)
+- **Stock writing back over a native string entry**: the `HSET` fails with `WRONGTYPE`, is
+  logged (`CacheBackendWriteFailure`, Error) and swallowed; **the native entry survives
+  byte-for-byte**. Consequence, also asserted: the stock side then re-runs the factory on
+  *every* call for that key — a degraded old fleet, not a broken one, but factory-per-call plus
+  an error log per read is loud and slow. Migration guidance: don't leave stock writers running
+  against a prefix the new fleet has taken over; flip the fleet (or change prefix) and let TTLs
+  age the rest out.
+- **Native `SET` over a stock hash entry succeeds** (`SET` is type-agnostic): our writes always
+  win, after which the stock side sees the logged-miss behaviour above.
+- **SE.Hybrid must mirror the same contract** (phase 2, to be asserted in the main test
+  project once the backend exists): meeting a stock hash entry — or any unparseable/foreign
+  value — is a **logged miss, never a surfaced error**, and our `UNLINK`/`SET` paths are
+  type-agnostic so removal and overwrite work regardless of what holds the key.
+
 ### Entry options and flags, mapped
 
 | contract | mapping |
@@ -309,7 +335,9 @@ Decisions so far
   rather than degrading, so live mixed fleets were never realistic. An optional one-directional
   migration read-fallback (native miss ⇒ try the stock hash layout) is parked in phase 4.
   Consequence of envelope compat: timestamp-based tag validation, clock skew accepted as in
-  stock (the envelope has no room for per-tag epochs).
+  stock (the envelope has no room for per-tag epochs). Mixed-mode behaviour in both directions
+  is validated against the real packages — see the mixed-mode section; headline: each side
+  treats the other's entries as a logged miss, never an error, and native writes always win.
 - **Tag keys**: `__SER_HCT__<tag>` — our sentinel, not Microsoft's `__MSFT_HCT__` — as plain
   strings, 8-byte LE UTC ticks (stock's value format).
 - **TFMs**: `netstandard2.0;net8.0;net10.0`; no explicit net472 for now — revisit if a netfx
