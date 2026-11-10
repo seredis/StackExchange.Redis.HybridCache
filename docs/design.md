@@ -306,6 +306,14 @@ None of these block phase 1.
 Phasing
 ---
 
+> **Status (2026-11-11)**: a working vertical slice is in: GetOrCreate/Set/Remove/RemoveByTag
+> (tags and `*` wildcard included) over plain-string entries, envelope byte-compat **validated
+> against the real `DefaultHybridCache` in both directions** (which also confirms the UtcTicks
+> clock base), serializer resolution incl. third-party factories (protobuf-net validated), the
+> foreign-entry-is-logged-miss contract asserted, and a client-side-caching smoke test (RESP3 +
+> `TrackingByPrefix`). Not yet: stampede combining, tag-timestamp memoization outside the CSC,
+> flags beyond the basics, metrics/logging polish, cluster/groups.
+
 1. **Skeleton + contract** (this repo, now): project layout, abstractions reference, stub
    `RedisHybridCache`, DI, options; CI; port of the stampede machinery with the redis backend
    stubbed; unit tests against a fake backend.
@@ -340,8 +348,21 @@ Decisions so far
   treats the other's entries as a logged miss, never an error, and native writes always win.
 - **Tag keys**: `__SER_HCT__<tag>` — our sentinel, not Microsoft's `__MSFT_HCT__` — as plain
   strings, 8-byte LE UTC ticks (stock's value format).
-- **TFMs**: `netstandard2.0;net8.0;net10.0`; no explicit net472 for now — revisit if a netfx
-  audience shows up (ns2.0 keeps the door open).
+- **TFMs**: `net472;netstandard2.0;net8.0;net10.0`. The downlevel targets turned out to be
+  almost free (checked concretely: one `System.Text.Json` package reference and two small
+  netstandard2.0 accommodations — no `ArrayBufferWriter`, no `GetOrAdd` state overload), so they
+  are in. Runtime validation on actual netfx still needs a Windows CI lane (tests currently run
+  on net8.0/net10.0 only).
+- **Dedicated connection, keyed by `typeof(HybridCache)`**: client-side caching is tightly
+  coupled to its connection (one cache per multiplexer, cache-wide tracking config, flush on
+  disconnect), so a separate multiplexer for the cache is actively encouraged. DI resolution
+  prefers a keyed `IConnectionMultiplexer` registration with the key `typeof(HybridCache)` —
+  the same keyed convention the HybridCache ecosystem already uses (protobuf-net.HybridCache
+  keys its optional `TypeModel` that way) — falling back to the unkeyed registration.
+- **Third-party serializer hooks work as-is** (validated): protobuf-net.HybridCache's
+  `AddProtobufNetHybridCacheSerializer()` plugs into our resolution chain unmodified, contract
+  types round-trip as protobuf (asserted not-JSON), non-contract types fall through to JSON, and
+  protobuf payloads interop with the stock implementation in both directions.
 - **Licensing/attribution**: dotnet/extensions is MIT; forked files keep their copyright header
   plus a provenance note, and `THIRD-PARTY-NOTICES.md` carries the notice (same pattern SE.Redis
   uses). (Trivially fine in this case — same original author — but kept for hygiene.)

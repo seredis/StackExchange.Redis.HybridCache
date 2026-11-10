@@ -1,6 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFrameworks>netstandard2.0;net8.0;net10.0</TargetFrameworks>
+    <TargetFrameworks>net472;netstandard2.0;net8.0;net10.0</TargetFrameworks>
     <Description>HybridCache built natively on StackExchange.Redis server-assisted client-side caching: one near cache, push invalidation, stampede protection.</Description>
     <PackageTags>redis;cache;hybridcache;client-side-caching;invalidation</PackageTags>
     <IsPackable>true</IsPackable>
@@ -13,6 +13,8 @@
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
     <PackageReference Include="Microsoft.Extensions.Options" />
+    <PackageReference Include="System.Text.Json" Condition="'$(TargetFramework)' == 'netstandard2.0' or '$(TargetFramework)' == 'net472'" />
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" PrivateAssets="all" Condition="'$(TargetFramework)' == 'net472'" />
     <!-- TODO (before first release): enable PublicApiAnalyzers + PublicAPI/*.txt, mirroring SE.Redis -->
     <!-- <PackageReference Include="Microsoft.CodeAnalysis.PublicApiAnalyzers" PrivateAssets="all" /> -->
   </ItemGroup>
