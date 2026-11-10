@@ -367,10 +367,15 @@ Decisions so far
   plus a provenance note, and `THIRD-PARTY-NOTICES.md` carries the notice (same pattern SE.Redis
   uses). (Trivially fine in this case — same original author — but kept for hygiene.)
 
+- **Strong-name signing** (resolved 2026-11-10): signed with the shared seredis key pair, the
+  same `StackExchange.Redis.snk` committed publicly in StackExchange/StackExchange.Redis —
+  public key token `c219ff1ca8c2ce46`, matching SE.Redis itself. Same-key-across-the-org is the
+  standard pattern (cf. Microsoft.Extensions.*), and the key was already public, so nothing new
+  to protect. `SignAssembly` on the shipped library only; tests stay unsigned.
+
 Open questions
 ---
 
-- **Strong-name signing**: SE.Redis signs; new key vs none for this package.
 - **Migration read-fallback** (phase 4, optional): build it at all? If so, pin the exact stock
   `Microsoft.Extensions.Caching.StackExchangeRedis` hash layout (it has shifted across
   versions, including the `IBufferDistributedCache` path) against the real packages.
