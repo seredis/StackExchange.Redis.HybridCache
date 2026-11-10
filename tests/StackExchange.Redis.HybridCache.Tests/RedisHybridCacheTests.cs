@@ -176,4 +176,40 @@ public class RedisHybridCacheTests : IClassFixture<RedisFixture>
         await cache.RemoveByTagAsync("ct", TestContext.Current.CancellationToken);
         Assert.Equal("v4", await cache.GetOrCreateAsync("c2", factory, tags: ["ct"], cancellationToken: TestContext.Current.CancellationToken));
     }
+
+    [Fact]
+    public async Task Reads_ForceAdmission_OnFirstMiss()
+    {
+        Assert.SkipWhen(_fx.Connection is null, _fx.SkipReason);
+
+        // deliberately NOT our recommended shape: plain Tracking (opt-out), no prefixes, default
+        // admission — so SE.Redis's doorkeeper holds an unflagged read back until its second miss
+        // (cache-second-time). Our reads carry CacheOptIn, which is documented (and here asserted)
+        // to force first-miss admission: being a HybridCache entry IS the admission decision.
+        var options = ConfigurationOptions.Parse($"{_fx.Host},connectTimeout=2000,abortConnect=true");
+        options.Protocol = RedisProtocol.Resp3;
+        options.ClientCache = new StackExchange.Redis.Caching.CacheOptions
+        {
+            TrackingMode = StackExchange.Redis.Caching.CacheTrackingMode.Tracking,
+        };
+        await using var muxer = await ConnectionMultiplexer.ConnectAsync(options);
+        var clientCache = muxer.GetClientCache()!;
+
+        await using var provider = CreateProvider(muxer, RedisFixture.NewPrefix());
+        var cache = provider.GetRequiredService<HybridCacheBase>();
+
+        await cache.SetAsync("adm", "value", cancellationToken: TestContext.Current.CancellationToken);
+        long before = clientCache.Stored;
+        Assert.Equal("value", await cache.GetOrCreateAsync(
+            "adm", _ => new ValueTask<string>("factory-must-not-run"), cancellationToken: TestContext.Current.CancellationToken));
+
+        // the fill is applied as the reply is processed; allow a beat for the counter
+        long stored = 0;
+        for (int i = 0; i < 20 && (stored = clientCache.Stored - before) == 0; i++)
+        {
+            await Task.Delay(25, TestContext.Current.CancellationToken);
+        }
+
+        Assert.True(stored >= 1, $"expected the single read to be admitted to the client cache; stored delta: {stored}");
+    }
 }

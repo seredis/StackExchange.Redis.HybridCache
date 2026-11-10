@@ -98,7 +98,9 @@ public sealed partial class RedisHybridCache : HybridCacheBase
             byte[]? blob = null;
             try
             {
-                blob = (byte[]?)await db.StringGetAsync(EntryKey(key)).ConfigureAwait(false);
+                // CacheOptIn: being a HybridCache entry *is* the admission decision — force first-miss
+                // admission (and reach) under every tracking mode, not just TrackingByPrefix
+                blob = (byte[]?)await db.StringGetAsync(EntryKey(key), CommandFlags.CacheOptIn).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -238,7 +240,9 @@ public sealed partial class RedisHybridCache : HybridCacheBase
     {
         try
         {
-            byte[]? value = (byte[]?)await db.StringGetAsync(TagKey(tag)).ConfigureAwait(false);
+            // tag timestamps are hot by construction (consulted on every read of a tagged entry);
+            // CacheOptIn makes them locally cached + push-coherent under every tracking mode
+            byte[]? value = (byte[]?)await db.StringGetAsync(TagKey(tag), CommandFlags.CacheOptIn).ConfigureAwait(false);
             return value is { Length: sizeof(long) } ? BinaryPrimitives.ReadInt64LittleEndian(value) : 0;
         }
         catch (Exception ex)

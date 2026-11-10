@@ -82,7 +82,19 @@ The capabilities that matter for this design:
   `Context.WithMaxCacheAge(TimeSpan)`, `WithoutCache()`.
 - **Admission** (TinyLFU doorkeeper, store on second miss) — bypassed by `CacheOptIn`/prefix
   opt-in, which is what we want: SE.Hybrid's reads are deliberate, so they should always store
-  on first miss.
+  on first miss. **Verified 2026-11-10** (v4 source `RespClientCache.cs` + empirically on
+  4.0.155-alpha against live redis): (a) under `TrackingByPrefix` every read inside the prefixes
+  admits on the *first* miss — the doorkeeper is skipped entirely ("inside the prefixes it IS an
+  opt-in"); (b) under plain `Tracking` (opt-out) an unflagged read is cache-second-time; (c)
+  `CommandFlags.CacheOptIn` forces first-miss admission in every mode, and under
+  `TrackingByPrefix` can even reach keys *outside* the configured prefixes (the flag is a
+  statement; the server tracks behind `CLIENT CACHING YES`). Consequently **SE.Hybrid passes
+  `CacheOptIn` on all its reads** (entries and tag keys): the admission decision was already
+  made at the HybridCache level, and this makes the near cache work at full strength under any
+  tracking mode — including `TrackingOptIn` and a prefix list that doesn't cover our keyspace —
+  not just the recommended dedicated-connection shape. Canary test:
+  `Reads_ForceAdmission_OnFirstMiss` (runs under doorkeeper-active `Tracking` mode, asserts the
+  single read stores).
 - **Policies**: `TimeToLive`, `RefreshAfter` (read-while-ageing; background re-send of the
   original request), `InvalidationGracePeriod` (read-while-stale after a remote change, one
   background refresh, never applies to own writes).
@@ -165,7 +177,21 @@ else. What changes is where the near copy of those timestamps lives and how it i
   validation is a local-memory read; the first read after an invalidation is the only round
   trip, once per process.
 - Cost on a miss: N tag-key reads (pipelined individual GETs — tag keys won't share a cluster
-  hash slot, so no MGET); all locally cached afterwards.
+  hash slot, so no MGET); all locally cached afterwards. Tag-key reads carry
+  `CommandFlags.CacheOptIn`, so they are admitted on their first miss and are locally cached +
+  push-coherent under *every* tracking mode, not only `TrackingByPrefix` — tag timestamps are
+  hot by construction (consulted on every read of a tagged entry, the wildcard on every read).
+- **Going further than the stock scheme** (the stock tag story is crude: locally memoized
+  timestamps with no cross-server coherence signal, and invalidated entries linger until lazily
+  filtered on read). Server-assisted invalidation lets us do better in two steps. *Already in*:
+  the timestamp keys themselves are push-coherent (above), so validation is a local read and
+  fleet-wide invalidation is one `SET`. *Phase 2/3, gated on the v4 outbound-invalidation hook
+  (candidate API #2 below)*: subscribe to invalidation of the tag keys to (a) memoize tag
+  timestamps in a plain dictionary — collapsing the N+1 per-read tag lookups to nothing on the
+  steady-state path, safely, because the push tells us exactly when to drop a memo — and (b)
+  optionally *actively evict* locally cached entries known to carry an invalidated tag (a local
+  tag→keys index feeding `ClientCache.Invalidate`), reclaiming memory immediately instead of
+  waiting for TTL/LRU while reads filter lazily.
 - **Clock skew is accepted**, as it is in the stock implementation (entry created on server A,
   tag invalidated from B, compared on C). A monotonic per-tag *counter* scheme would remove
   clocks from the correctness argument entirely, but the entry side of the comparison lives in
@@ -293,9 +319,13 @@ caching API. Current list:
 1. *(phase 2)* **Entry identity on cached reads** — enough to key a deserialized-object memo.
    Smallest viable shape: lease/result exposes an opaque version token stable for the lifetime of
    the stored entry.
-2. *(phase 3, maybe never)* **Outbound invalidation notification** on `ClientCache` — per-key
-   callback when the server (or a local write) invalidates. Deliberately absent today; would need
-   care re: callback cost on the reader path.
+2. *(promoted to phase 2 — now has two consumers)* **Outbound invalidation notification** on
+   `ClientCache` — per-key callback when the server (or a local write) invalidates. Deliberately
+   absent today; would need care re: callback cost on the reader path. Originally phase-3-maybe
+   (deserialized-memo eviction); now also the key to the better tag story: memoized tag
+   timestamps dropped on push (removing the N+1 per-read tag GETs) and active eviction of
+   tagged entries (see Tags section). A narrow shape would do: registration filtered to exact
+   keys we name, fired off the reader path.
 3. *(nice-to-have)* Split `CacheOptOut` into read-suppression vs store-suppression for the
    `DisableLocalCacheRead/Write` flags' exact semantics.
 4. *(check, probably exists)* Per-call read returning a lease over the payload without copy
