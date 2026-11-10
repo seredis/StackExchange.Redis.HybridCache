@@ -142,6 +142,12 @@ csharp_preserve_single_line_blocks = true
 # Tags     : Telemetry, EnabledRuleInAggressiveMode, CompilationEnd
 dotnet_diagnostic.CA1852.severity = warning
 
+# PublicApiAnalyzers
+# RS0026 (multiple overloads with optional parameters): the pattern comes from the abstract
+# HybridCache base class we override; the overload-resolution hazard is the abstractions
+# package's call, not ours.
+dotnet_diagnostic.RS0026.severity = none
+
 # IDE preferences
 dotnet_diagnostic.IDE0090.severity = silent # IDE0090: Use 'new(...)'
 

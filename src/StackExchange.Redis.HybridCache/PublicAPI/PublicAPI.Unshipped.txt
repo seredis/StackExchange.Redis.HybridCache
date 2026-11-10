@@ -1,0 +1,20 @@
+#nullable enable
+Microsoft.Extensions.DependencyInjection.RedisHybridCacheServiceExtensions
+override StackExchange.Redis.HybridCache.RedisHybridCache.GetOrCreateAsync<TState, T>(string! key, TState state, System.Func<TState, System.Threading.CancellationToken, System.Threading.Tasks.ValueTask<T>>! factory, Microsoft.Extensions.Caching.Hybrid.HybridCacheEntryOptions? options = null, System.Collections.Generic.IEnumerable<string!>? tags = null, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask<T>
+override StackExchange.Redis.HybridCache.RedisHybridCache.RemoveAsync(string! key, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask
+override StackExchange.Redis.HybridCache.RedisHybridCache.RemoveAsync(System.Collections.Generic.IEnumerable<string!>! keys, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask
+override StackExchange.Redis.HybridCache.RedisHybridCache.RemoveByTagAsync(string! tag, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask
+override StackExchange.Redis.HybridCache.RedisHybridCache.RemoveByTagAsync(System.Collections.Generic.IEnumerable<string!>! tags, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask
+override StackExchange.Redis.HybridCache.RedisHybridCache.SetAsync<T>(string! key, T value, Microsoft.Extensions.Caching.Hybrid.HybridCacheEntryOptions? options = null, System.Collections.Generic.IEnumerable<string!>? tags = null, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask
+StackExchange.Redis.HybridCache.RedisHybridCache
+StackExchange.Redis.HybridCache.RedisHybridCacheOptions
+StackExchange.Redis.HybridCache.RedisHybridCacheOptions.DefaultEntryOptions.get -> Microsoft.Extensions.Caching.Hybrid.HybridCacheEntryOptions?
+StackExchange.Redis.HybridCache.RedisHybridCacheOptions.DefaultEntryOptions.set -> void
+StackExchange.Redis.HybridCache.RedisHybridCacheOptions.KeyPrefix.get -> string!
+StackExchange.Redis.HybridCache.RedisHybridCacheOptions.KeyPrefix.set -> void
+StackExchange.Redis.HybridCache.RedisHybridCacheOptions.MaximumKeyLength.get -> int
+StackExchange.Redis.HybridCache.RedisHybridCacheOptions.MaximumKeyLength.set -> void
+StackExchange.Redis.HybridCache.RedisHybridCacheOptions.MaximumPayloadBytes.get -> long
+StackExchange.Redis.HybridCache.RedisHybridCacheOptions.MaximumPayloadBytes.set -> void
+StackExchange.Redis.HybridCache.RedisHybridCacheOptions.RedisHybridCacheOptions() -> void
+static Microsoft.Extensions.DependencyInjection.RedisHybridCacheServiceExtensions.AddRedisHybridCache(this Microsoft.Extensions.DependencyInjection.IServiceCollection! services, System.Action<StackExchange.Redis.HybridCache.RedisHybridCacheOptions!>? configure = null) -> Microsoft.Extensions.DependencyInjection.IServiceCollection!
