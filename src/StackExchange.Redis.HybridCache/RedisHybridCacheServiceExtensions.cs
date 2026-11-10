@@ -5,6 +5,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using StackExchange.Redis;
 using StackExchange.Redis.HybridCache;
+using StackExchange.Redis.HybridCache.Internal;
 
 namespace Microsoft.Extensions.DependencyInjection;
 
@@ -42,6 +43,15 @@ public static class RedisHybridCacheServiceExtensions
         }
 
         services.AddOptions();
+
+        // serializer registrations, mirroring the in-box AddHybridCache: inbuilt handling for
+        // string/byte[], and a factory covering everything else via System.Text.Json (honouring
+        // JsonSerializerOptions keyed by the open/closed IHybridCacheSerializer<> types)
+        services.TryAddSingleton(TimeProvider.System);
+        services.TryAddSingleton<IHybridCacheSerializerFactory, DefaultJsonSerializerFactory>();
+        services.TryAddSingleton<IHybridCacheSerializer<string>>(InbuiltSerializers.StringSerializer.Instance);
+        services.TryAddSingleton<IHybridCacheSerializer<byte[]>>(InbuiltSerializers.ByteArraySerializer.Instance);
+
         services.TryAddSingleton<HybridCache>(static provider =>
         {
             // prefer a cache-dedicated connection, keyed by typeof(HybridCache) — the same keyed

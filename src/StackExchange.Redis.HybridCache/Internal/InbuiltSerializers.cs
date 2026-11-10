@@ -40,16 +40,20 @@ internal static class InbuiltSerializers
 
     public sealed class DefaultJsonSerializer<T> : IHybridCacheSerializer<T>
     {
+        private readonly JsonSerializerOptions? _options;
+
+        public DefaultJsonSerializer(JsonSerializerOptions? options = null) => _options = options;
+
         public T Deserialize(ReadOnlySequence<byte> source)
         {
             var reader = new Utf8JsonReader(source);
-            return JsonSerializer.Deserialize<T>(ref reader)!;
+            return JsonSerializer.Deserialize<T>(ref reader, _options)!;
         }
 
         public void Serialize(T value, IBufferWriter<byte> target)
         {
             using var writer = new Utf8JsonWriter(target);
-            JsonSerializer.Serialize(writer, value);
+            JsonSerializer.Serialize(writer, value, _options);
         }
     }
 }
