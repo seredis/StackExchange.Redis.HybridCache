@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/StackExchange.Redis.HybridCache/StackExchange.Redis.HybridCache.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/StackExchange.Redis.HybridCache.Tests/StackExchange.Redis.HybridCache.Tests.csproj" />
+  </Folder>
+  <Folder Name="/docs/">
+    <File Path="docs/design.md" />
+    <File Path="README.md" />
+  </Folder>
+</Solution>
