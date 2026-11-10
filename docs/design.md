@@ -343,6 +343,17 @@ Phasing
 > foreign-entry-is-logged-miss contract asserted, and a client-side-caching smoke test (RESP3 +
 > `TrackingByPrefix`). Not yet: stampede combining, tag-timestamp memoization outside the CSC,
 > flags beyond the basics, metrics/logging polish, cluster/groups.
+>
+> **Status (2026-11-10, post-parity)**: feature parity with the stock `DefaultHybridCache` is
+> implemented per [parity-plan.md](parity-plan.md) — stampede combining (full port, incl.
+> shared-cancellation and immutable/mutable value semantics), all six flags, validation parity,
+> `TagSet` + post-factory tag-race handling, `Log.cs` with the stock event IDs, the
+> `StackExchange-Redis-HybridCache` EventSource, `DefaultJsonSerializerFactory` behaviour,
+> injected `TimeProvider`, and batch remove overrides. The inherited stock test suites
+> (stampede, types, tags, EventSource, validation/fault-injection/expiry concepts) pass
+> unmodified in assertion content; the deliberate divergences are listed in the plan. Still
+> ahead: the phase-2/3 items below (deserialized memo + outbound-invalidation hook, perf,
+> cluster/groups, migration fallback).
 
 1. **Skeleton + contract** (this repo, now): project layout, abstractions reference, stub
    `RedisHybridCache`, DI, options; CI; port of the stampede machinery with the redis backend

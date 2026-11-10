@@ -18,9 +18,14 @@ is deliberately unsupported (it is incompatible with client-side caching; the de
 explain why) — and the payload envelope stays byte-compatible with the default implementation's,
 given the same serializer configuration.
 
-> **Status: skeleton.** The public shape and build exist; the implementation does not yet.
-> Start with [docs/design.md](docs/design.md) — architecture, the fork map from
-> `Microsoft.Extensions.Caching.Hybrid` internals, tag-epoch design, phasing, open questions.
+> **Status: functional, pre-release.** The full `HybridCache` surface is implemented at
+> feature parity with the stock implementation — stampede protection (query combination with
+> shared cancellation and immutable/mutable value semantics), all entry flags, key/tag
+> validation, tag invalidation (push-coherent, server-assisted), logging and `EventSource`
+> telemetry with the stock event IDs, `TimeProvider` support — and the stock test suites have
+> been inherited and pass. See [docs/design.md](docs/design.md) for architecture and
+> remaining phases, and [docs/parity-plan.md](docs/parity-plan.md) for the parity inventory
+> and the deliberate divergences.
 
 Layout
 ---

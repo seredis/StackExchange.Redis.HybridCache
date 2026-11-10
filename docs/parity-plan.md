@@ -6,6 +6,14 @@ Reference: `dotnet/extensions` `main`, `src/Libraries/Microsoft.Extensions.Cachi
 covered by `THIRD-PARTY-NOTICES.md`; ported files keep the .NET Foundation header plus a
 provenance note, as the envelope fork already does).
 
+> **Status: implemented (2026-11-10).** All thirteen gap rows and implementation-order steps
+> 1–4 are done; #13 remains track-only by design, and the two items explicitly deferred to the
+> v4 outbound-invalidation hook (tag-timestamp memoization in #7, the deserialized-object memo
+> behind the first divergence) stay deferred. The three documented divergences are asserted in
+> the ported tests. Suite at completion: 202 tests in the main project (net8.0 + net10.0,
+> against live redis) plus 6 mixed-mode byte-compat tests, all green; Release builds clean on
+> all four library TFMs.
+
 Gap inventory
 ---
 
