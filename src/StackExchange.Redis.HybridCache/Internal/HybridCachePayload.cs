@@ -64,7 +64,7 @@ internal static class HybridCachePayload
         public string[] Tags { get; }
     }
 
-    public static int GetMaxBytes(string key, string[] tags, int payloadSize)
+    public static int GetMaxBytes(string key, in TagSet tags, int payloadSize)
     {
         int length =
             2 // sentinel+version
@@ -78,9 +78,10 @@ internal static class HybridCachePayload
             + GetMaxStringLength(key.Length)
             + payloadSize;
 
-        foreach (string tag in tags)
+        int tagCount = tags.Count;
+        for (int i = 0; i < tagCount; i++)
         {
-            length += GetMaxStringLength(tag.Length);
+            length += GetMaxStringLength(tags[i].Length);
         }
 
         return length;
@@ -89,7 +90,7 @@ internal static class HybridCachePayload
     }
 
     /// <summary>Writes a v1 envelope; returns the bytes written.</summary>
-    public static int Write(byte[] destination, string key, long creationTime, TimeSpan duration, string[] tags, in ReadOnlySequence<byte> payload)
+    public static int Write(byte[] destination, string key, long creationTime, TimeSpan duration, in TagSet tags, in ReadOnlySequence<byte> payload)
     {
         int payloadLength = checked((int)payload.Length);
 
@@ -107,11 +108,12 @@ internal static class HybridCachePayload
         Write7BitEncodedInt64(destination, ref len, 0); // flags (none; we never persist a local-size override)
         Write7BitEncodedInt64(destination, ref len, (ulong)payloadLength);
         Write7BitEncodedInt64(destination, ref len, (ulong)durationTicks);
-        Write7BitEncodedInt64(destination, ref len, (ulong)tags.Length);
+        int tagCount = tags.Count;
+        Write7BitEncodedInt64(destination, ref len, (ulong)tagCount);
         WriteString(destination, ref len, key);
-        foreach (string tag in tags)
+        for (int i = 0; i < tagCount; i++)
         {
-            WriteString(destination, ref len, tag);
+            WriteString(destination, ref len, tags[i]);
         }
 
         payload.CopyTo(destination.AsSpan(len, payloadLength));

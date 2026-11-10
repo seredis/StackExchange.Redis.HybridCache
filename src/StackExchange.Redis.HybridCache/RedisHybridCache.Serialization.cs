@@ -14,8 +14,59 @@ public sealed partial class RedisHybridCache
     private readonly IServiceProvider? _services;
     private readonly ConcurrentDictionary<Type, object> _serializers = new();
 
+    internal int MaximumPayloadBytes { get; }
+
     internal IHybridCacheSerializer<T> GetSerializer<T>()
         => (IHybridCacheSerializer<T>)_serializers.GetOrAdd(typeof(T), _ => ResolveSerializer<T>()); // netstandard2.0: no TArg overload
+
+    internal bool TrySerialize<T>(T value, out BufferChunk buffer, out IHybridCacheSerializer<T>? serializer)
+    {
+        // note: also returns the serializer we resolved, because most-any time we want to serialize, we'll also want
+        // to make sure we use that same instance later (without needing to re-resolve)
+
+        RecyclableArrayBufferWriter<byte>? writer = null;
+        buffer = default;
+        try
+        {
+            writer = RecyclableArrayBufferWriter<byte>.Create(MaximumPayloadBytes); // note this lifetime spans the backend write
+            serializer = GetSerializer<T>();
+
+            serializer.Serialize(value, writer);
+
+            buffer = new(writer.DetachCommitted(out int length), 0, length, returnToPool: true); // remove buffer ownership from the writer
+            writer.Dispose(); // we're done with the writer
+            return true;
+        }
+        catch (Exception ex)
+        {
+            bool knownCause = false;
+
+            // ^^^ if we know what happened, we can record directly via cause-specific events
+            // and treat as a handled failure (i.e. return false) - otherwise, we'll bubble
+            // the fault up a few layers *in addition to* logging in a failure event
+
+            if (writer is not null)
+            {
+                if (writer.QuotaExceeded)
+                {
+                    _logger.MaximumPayloadBytesExceeded(ex, MaximumPayloadBytes);
+                    knownCause = true;
+                }
+
+                writer.Dispose();
+            }
+
+            if (!knownCause)
+            {
+                _logger.SerializationFailure(ex);
+                throw;
+            }
+
+            buffer = default;
+            serializer = null;
+            return false;
+        }
+    }
 
     private bool TryDeserialize<T>(ArraySegment<byte> payload, out T value)
     {
@@ -27,7 +78,7 @@ public sealed partial class RedisHybridCache
         catch (Exception ex)
         {
             // an undeserializable payload (foreign serializer, schema change) is a logged miss
-            _logger.LogError(ex, "Cache payload deserialization failure; treating as a miss.");
+            _logger.DeserializationFailure(ex);
             value = default!;
             return false;
         }

@@ -1,7 +1,5 @@
 using System;
-using System.Buffers.Binary;
 using System.Collections.Generic;
-using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Caching.Hybrid;
@@ -9,9 +7,6 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using StackExchange.Redis.HybridCache.Internal;
-
-// the namespace shadows the base type's name; alias it once
-using HybridCacheBase = Microsoft.Extensions.Caching.Hybrid.HybridCache;
 
 namespace StackExchange.Redis.HybridCache;
 
@@ -32,28 +27,38 @@ namespace StackExchange.Redis.HybridCache;
 /// tag invalidation is coherent across the fleet rather than local-plus-eventual.
 /// </para>
 /// <para>
+/// Concurrent <c>GetOrCreateAsync</c> calls for the same key and flags are combined (stampede
+/// protection): one underlying fetch runs, late callers join it, and the operation is only
+/// cancelled when the last joined caller has cancelled. Mutable result types get a defensive
+/// copy per caller (deserialized from the shared serialized form); immutable types (strings,
+/// blittable values, and sealed types marked <c>[ImmutableObject(true)]</c>) share the instance.
+/// </para>
+/// <para>
 /// The payload envelope is byte-compatible with the default implementation's
 /// (<c>HybridCachePayload</c>), given the same serializer configuration; the redis-level
 /// representation is not. An entry holding a foreign value (for example a stock hash entry, or
 /// anything unparseable) is treated as a logged miss, never a surfaced error.
-/// See <c>docs/design.md</c> for the architecture and phasing.
-/// </para>
-/// <para>
-/// Phase 1 limitations: no stampede protection yet (concurrent callers for the same key each
-/// run the factory), and per-read tag-timestamp lookups are not locally memoized (the
-/// client-side cache provides that when enabled).
+/// See <c>docs/design.md</c> and <c>docs/parity-plan.md</c> for the architecture, the deliberate
+/// divergences from the in-box implementation, and phasing.
 /// </para>
 /// </remarks>
-public sealed partial class RedisHybridCache : HybridCacheBase
+public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybrid.HybridCache
 {
     internal const string TagKeyInfix = "__SER_HCT__";
-    internal const string WildcardTag = "*";
+    internal const string WildcardTag = TagSet.WildcardTag;
+    internal const int DefaultExpirationMinutes = 5; // mirrors stock
+
     private static readonly TimeSpan _tagKeyLifetime = TimeSpan.FromDays(1000); // mirrors stock MaxCacheDays
-    private static readonly TimeSpan _defaultExpiration = TimeSpan.FromMinutes(5); // stock default
 
     private readonly IConnectionMultiplexer _multiplexer;
     private readonly RedisHybridCacheOptions _options;
-    private readonly ILogger<RedisHybridCache> _logger;
+    private readonly ILogger _logger;
+    private readonly TimeProvider _clock;
+
+    private readonly HybridCacheEntryFlags _hardFlags; // *always* present (none today: the backend is mandatory)
+    private readonly HybridCacheEntryFlags _defaultFlags; // note this already includes hardFlags
+    private readonly TimeSpan _defaultExpiration;
+    private readonly int _maximumKeyLength;
 
     internal RedisHybridCache(
         IConnectionMultiplexer multiplexer,
@@ -65,18 +70,21 @@ public sealed partial class RedisHybridCache : HybridCacheBase
         _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
         _logger = logger ?? NullLogger<RedisHybridCache>.Instance;
         _services = services;
+        _clock = (TimeProvider?)services?.GetService(typeof(TimeProvider)) ?? TimeProvider.System;
+
+        MaximumPayloadBytes = checked((int)_options.MaximumPayloadBytes);
+        _maximumKeyLength = _options.MaximumKeyLength;
+
+        HybridCacheEntryOptions? defaultEntryOptions = _options.DefaultEntryOptions;
+        _hardFlags = HybridCacheEntryFlags.None;
+        _defaultFlags = (defaultEntryOptions?.Flags ?? HybridCacheEntryFlags.None) | _hardFlags;
+        _defaultExpiration = defaultEntryOptions?.Expiration ?? TimeSpan.FromMinutes(DefaultExpirationMinutes);
     }
 
-    private IDatabase Database => _multiplexer.GetDatabase();
-
-    private static long NowTicks => DateTimeOffset.UtcNow.UtcTicks;
-
-    private RedisKey EntryKey(string key) => _options.KeyPrefix + key;
-
-    private RedisKey TagKey(string tag) => _options.KeyPrefix + TagKeyInfix + tag;
+    internal RedisHybridCacheOptions Options => _options;
 
     /// <inheritdoc />
-    public override async ValueTask<T> GetOrCreateAsync<TState, T>(
+    public override ValueTask<T> GetOrCreateAsync<TState, T>(
         string key,
         TState state,
         Func<TState, CancellationToken, ValueTask<T>> factory,
@@ -89,63 +97,137 @@ public sealed partial class RedisHybridCache : HybridCacheBase
             throw new ArgumentNullException(nameof(factory));
         }
 
-        HybridCacheEntryFlags flags = EffectiveFlags(options);
-        bool keyUsable = ValidateKey(key);
-        IDatabase db = Database;
-
-        if (keyUsable && (flags & HybridCacheEntryFlags.DisableDistributedCacheRead) == 0)
+        bool canBeCanceled = cancellationToken.CanBeCanceled;
+        if (canBeCanceled)
         {
-            byte[]? blob = null;
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+
+        HybridCacheEntryFlags flags = GetEffectiveFlags(options);
+        if (!ValidateKey(key))
+        {
+            // the cache mechanisms are bypassed entirely (matching stock behaviour)
+            return (flags & HybridCacheEntryFlags.DisableUnderlyingData) == 0
+                ? factory(state, cancellationToken) : default;
+        }
+
+        return GetOrCreateCoreAsync(key, state, factory, options, tags, flags, canBeCanceled, cancellationToken);
+    }
+
+    private async ValueTask<T> GetOrCreateCoreAsync<TState, T>(
+        string key,
+        TState state,
+        Func<TState, CancellationToken, ValueTask<T>> factory,
+        HybridCacheEntryOptions? options,
+        IEnumerable<string>? tags,
+        HybridCacheEntryFlags flags,
+        bool canBeCanceled,
+        CancellationToken cancellationToken)
+    {
+        bool eventSourceEnabled = HybridCacheEventSource.Log.IsEnabled();
+
+        // Fast path: a direct read, outside any stampede - with client-side caching enabled this
+        // is the equivalent of the stock implementation's L1 hit, costing no stampede allocation.
+        // (The in-stampede read only runs for the rare contested-creation path; see the stampede
+        // partials.)
+        bool readPerformed = false;
+        if ((flags & HybridCacheEntryFlags.DisableDistributedCacheRead) == 0)
+        {
+            readPerformed = true;
+
+            // overlap the wildcard-invalidation read (needed to validate any payload) with the entry read
+            Task<long> wildcard = GetTagInvalidationTicksAsync(WildcardTag);
+
+            BufferChunk blob = default;
             try
             {
-                // CacheOptIn: being a HybridCache entry *is* the admission decision — force first-miss
-                // admission (and reach) under every tracking mode, not just TrackingByPrefix
-                blob = (byte[]?)await db.StringGetAsync(EntryKey(key), CommandFlags.CacheOptIn).ConfigureAwait(false);
+                if (eventSourceEnabled)
+                {
+                    HybridCacheEventSource.Log.DistributedCacheGet();
+                }
+
+                blob = await GetFromBackendAsync(key, flags).ConfigureAwait(false);
+                if (eventSourceEnabled)
+                {
+                    if (blob.HasValue)
+                    {
+                        HybridCacheEventSource.Log.DistributedCacheHit();
+                    }
+                    else
+                    {
+                        HybridCacheEventSource.Log.DistributedCacheMiss();
+                    }
+                }
             }
             catch (Exception ex)
             {
-                // includes WRONGTYPE from a foreign (e.g. stock hash) entry: a logged miss, never an error
-                _logger.LogError(ex, "Cache backend read failure.");
-            }
-
-            if (blob is not null && TryGetPayload(blob, key, out HybridCachePayload.Parsed parsed)
-                && await AreTagsCurrentAsync(db, parsed.CreationTime, parsed.Tags).ConfigureAwait(false))
-            {
-                if (TryDeserialize(parsed.Payload, out T value))
+                if (eventSourceEnabled)
                 {
-                    return value;
+                    HybridCacheEventSource.Log.DistributedCacheFailed();
                 }
+
+                // includes WRONGTYPE from a foreign (e.g. stock hash) entry: a logged miss, never an error
+                _logger.CacheUnderlyingDataQueryFailure(ex);
+            }
+
+            if (blob.HasValue
+                && TryGetPayload(blob.AsArraySegment(), key, out HybridCachePayload.Parsed parsed)
+                && await AreTagsCurrentAsync(parsed.CreationTime, parsed.Tags, wildcard).ConfigureAwait(false)
+                && TryDeserialize(parsed.Payload, out T value))
+            {
+                return value;
             }
         }
 
-        if ((flags & HybridCacheEntryFlags.DisableUnderlyingData) != 0)
+        // miss: join or create the shared operation for this (key, flags)
+        bool isNew = GetOrCreateStampedeState<TState, T>(key, flags, out StampedeState<TState, T> stampede, canBeCanceled, tags, out bool newStateCanSkipRead);
+        if (!isNew)
         {
-            return default!;
+            if (eventSourceEnabled)
+            {
+                HybridCacheEventSource.Log.StampedeJoin();
+            }
+
+            return await stampede.JoinAsync(_logger, cancellationToken).ConfigureAwait(false);
         }
 
-        T created = await factory(state, cancellationToken).ConfigureAwait(false);
+        // we own this stampede and must dispatch the factory; our own fresh miss means the
+        // stampede need not re-read the backend, unless creation was contested (see Stampede partial)
+        bool skipInitialRead = readPerformed && newStateCanSkipRead;
 
-        if (keyUsable && (flags & HybridCacheEntryFlags.DisableDistributedCacheWrite) == 0)
+        if (canBeCanceled)
         {
-            await WriteEntryAsync(db, key, created, options, tags).ConfigureAwait(false);
+            // *we* might cancel, but someone else might be depending on the result; start the
+            // work independently, then join the outcome
+            stampede.QueueUserWorkItem(state, factory, options, skipInitialRead);
+            return await stampede.JoinAsync(_logger, cancellationToken).ConfigureAwait(false);
         }
 
-        return created;
+        // we're going to run to completion; no need to get complicated
+        _ = stampede.ExecuteDirectAsync(state, factory, options, skipInitialRead); // this larger task includes the backend write etc
+
+        return await stampede.UnwrapReservedAsync(_logger).ConfigureAwait(false);
     }
 
     /// <inheritdoc />
-    public override async ValueTask SetAsync<T>(
+    public override ValueTask SetAsync<T>(
         string key,
         T value,
         HybridCacheEntryOptions? options = null,
         IEnumerable<string>? tags = null,
         CancellationToken cancellationToken = default)
     {
-        HybridCacheEntryFlags flags = EffectiveFlags(options);
-        if (ValidateKey(key) && (flags & HybridCacheEntryFlags.DisableDistributedCacheWrite) == 0)
+        if (!ValidateKey(key))
         {
-            await WriteEntryAsync(Database, key, value, options, tags).ConfigureAwait(false);
+            return default; // nowhere to sensibly write (matching the GetOrCreateAsync bypass)
         }
+
+        // since we're forcing a write: disable read; we use a direct pass-thru of the value as the
+        // callback, to reuse all the machinery (validation, tag-race handling, serialization, write).
+        // note also that this stampede is standalone: it is never registered for joining.
+        HybridCacheEntryFlags flags = GetEffectiveFlags(options) | (HybridCacheEntryFlags.DisableLocalCacheRead | HybridCacheEntryFlags.DisableDistributedCacheRead);
+        var state = new StampedeState<T, T>(this, new StampedeKey(key, flags), TagSet.Create(tags), cancellationToken);
+        return new(state.ExecuteDirectAsync(value, static (value, _) => new(value), options, skipInitialRead: true)); // spans the backend write etc
     }
 
     /// <inheritdoc />
@@ -160,148 +242,120 @@ public sealed partial class RedisHybridCache : HybridCacheBase
     }
 
     /// <inheritdoc />
-    public override async ValueTask RemoveByTagAsync(string tag, CancellationToken cancellationToken = default)
+    public override async ValueTask RemoveAsync(IEnumerable<string> keys, CancellationToken cancellationToken = default)
+    {
+        if (keys is null)
+        {
+            throw new ArgumentNullException(nameof(keys));
+        }
+
+        // individual deletes, issued concurrently: they pipeline on the multiplexer, and unlike a
+        // single multi-key DEL they cannot fail on cluster slot boundaries
+        List<Task>? pending = null;
+        foreach (string key in keys)
+        {
+            if (ValidateKey(key))
+            {
+                (pending ??= []).Add(Database.KeyDeleteAsync(EntryKey(key)));
+            }
+        }
+
+        if (pending is not null)
+        {
+            await Task.WhenAll(pending).ConfigureAwait(false);
+        }
+    }
+
+    /// <inheritdoc />
+    public override ValueTask RemoveByTagAsync(string tag, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(tag))
         {
-            return; // nothing sensible to do (matches stock)
+            return default; // nothing sensible to do (matches stock)
         }
 
-        byte[] ticks = new byte[sizeof(long)];
-        BinaryPrimitives.WriteInt64LittleEndian(ticks, NowTicks);
+        if (HybridCacheEventSource.Log.IsEnabled())
+        {
+            HybridCacheEventSource.Log.TagInvalidated();
+        }
 
-        // entries created before this instant are now invalid; every client's cached copy of the
-        // tag key is push-invalidated, so the whole fleet converges within the push latency
-        await Database.StringSetAsync(TagKey(tag), ticks, _tagKeyLifetime).ConfigureAwait(false);
+        return new(InvalidateTagAsync(tag, CurrentTimestamp()));
     }
 
-    private HybridCacheEntryFlags EffectiveFlags(HybridCacheEntryOptions? options)
-        => options?.Flags ?? _options.DefaultEntryOptions?.Flags ?? HybridCacheEntryFlags.None;
+    /// <inheritdoc />
+    public override async ValueTask RemoveByTagAsync(IEnumerable<string> tags, CancellationToken cancellationToken = default)
+    {
+        if (tags is null)
+        {
+            throw new ArgumentNullException(nameof(tags));
+        }
 
-    private TimeSpan EffectiveExpiration(HybridCacheEntryOptions? options)
-        => options?.Expiration ?? _options.DefaultEntryOptions?.Expiration ?? _defaultExpiration;
+        bool eventSourceEnabled = HybridCacheEventSource.Log.IsEnabled();
+        long timestamp = CurrentTimestamp(); // one instant for the whole batch
+        List<Task>? pending = null;
+        foreach (string tag in tags)
+        {
+            if (!string.IsNullOrWhiteSpace(tag))
+            {
+                if (eventSourceEnabled)
+                {
+                    HybridCacheEventSource.Log.TagInvalidated();
+                }
+
+                (pending ??= []).Add(InvalidateTagAsync(tag, timestamp));
+            }
+        }
+
+        if (pending is not null)
+        {
+            await Task.WhenAll(pending).ConfigureAwait(false);
+        }
+    }
+
+    internal HybridCacheEntryFlags GetEffectiveFlags(HybridCacheEntryOptions? options)
+        => (options?.Flags | _hardFlags) ?? _defaultFlags;
+
+    // reserve non-printable characters from keys, to prevent potential backend abuse
+    private static bool ContainsReservedCharacters(ReadOnlySpan<char> key)
+    {
+        const char MaxControlChar = (char)31;
+
+#if NET8_0_OR_GREATER
+        return key.IndexOfAnyInRange((char)0, MaxControlChar) >= 0;
+#else
+        foreach (char c in key)
+        {
+            if (c <= MaxControlChar)
+            {
+                return true;
+            }
+        }
+
+        return false;
+#endif
+    }
 
     private bool ValidateKey(string key)
     {
-        if (string.IsNullOrEmpty(key))
+        if (string.IsNullOrWhiteSpace(key))
         {
-            throw new ArgumentException("A cache key must be provided.", nameof(key));
-        }
-
-        if (key.Length > _options.MaximumKeyLength)
-        {
-            // matches the documented contract: over-length keys bypass the cache mechanisms
-            _logger.LogWarning("Cache key exceeds MaximumKeyLength ({Length} > {Max}); bypassing cache.", key.Length, _options.MaximumKeyLength);
+            _logger.KeyEmptyOrWhitespace();
             return false;
         }
 
-        return true;
-    }
-
-    private bool TryGetPayload(byte[] blob, string key, out HybridCachePayload.Parsed parsed)
-    {
-        HybridCachePayload.ParseResult result = HybridCachePayload.TryParse(
-            new ArraySegment<byte>(blob), key, NowTicks, out parsed, out Exception? fault);
-        switch (result)
+        if (key.Length > _maximumKeyLength)
         {
-            case HybridCachePayload.ParseResult.Success:
-                return true;
-            case HybridCachePayload.ParseResult.ExpiredByEntry:
-                return false; // normal: redis TTL has coarser resolution than the envelope duration
-            case HybridCachePayload.ParseResult.ParseFault:
-                _logger.LogError(fault, "Cache payload parse fault for key; treating as a miss.");
-                return false;
-            default:
-                // foreign or damaged content, or a key-echo mismatch (colliding/case-insensitive backend)
-                _logger.LogWarning("Cache payload not usable ({Result}); treating as a miss.", result);
-                return false;
-        }
-    }
-
-    private async ValueTask<bool> AreTagsCurrentAsync(IDatabase db, long creationTime, string[] tags)
-    {
-        if (await GetTagInvalidationTicksAsync(db, WildcardTag).ConfigureAwait(false) >= creationTime)
-        {
+            _logger.MaximumKeyLengthExceeded(_maximumKeyLength, key.Length);
             return false;
         }
 
-        foreach (string tag in tags)
+        if (ContainsReservedCharacters(key.AsSpan()))
         {
-            if (await GetTagInvalidationTicksAsync(db, tag).ConfigureAwait(false) >= creationTime)
-            {
-                return false;
-            }
+            _logger.KeyInvalidContent();
+            return false;
         }
 
+        // nothing to complain about
         return true;
-    }
-
-    private async ValueTask<long> GetTagInvalidationTicksAsync(IDatabase db, string tag)
-    {
-        try
-        {
-            // tag timestamps are hot by construction (consulted on every read of a tagged entry);
-            // CacheOptIn makes them locally cached + push-coherent under every tracking mode
-            byte[]? value = (byte[]?)await db.StringGetAsync(TagKey(tag), CommandFlags.CacheOptIn).ConfigureAwait(false);
-            return value is { Length: sizeof(long) } ? BinaryPrimitives.ReadInt64LittleEndian(value) : 0;
-        }
-        catch (Exception ex)
-        {
-            // fail closed, matching stock: an unreadable tag invalidates everything it covers,
-            // which costs a refill but never serves a value past its invalidation
-            _logger.LogError(ex, "Tag invalidation read failure; treating tag as expired.");
-            return long.MaxValue;
-        }
-    }
-
-    private async ValueTask WriteEntryAsync<T>(IDatabase db, string key, T value, HybridCacheEntryOptions? options, IEnumerable<string>? tags)
-    {
-        try
-        {
-            string[] tagArray = tags switch
-            {
-                null => [],
-                string[] arr => arr,
-                _ => tags.ToArray(),
-            };
-            foreach (string tag in tagArray)
-            {
-                if (string.IsNullOrWhiteSpace(tag) || tag == WildcardTag)
-                {
-                    throw new ArgumentException($"Tags cannot be empty or '{WildcardTag}'.", nameof(tags));
-                }
-            }
-
-            using var writer = new PooledBufferWriter();
-            GetSerializer<T>().Serialize(value, writer);
-
-            if (writer.Length > _options.MaximumPayloadBytes)
-            {
-                _logger.LogWarning("Serialized payload for key exceeds MaximumPayloadBytes ({Length} > {Max}); not stored.", writer.Length, _options.MaximumPayloadBytes);
-                return;
-            }
-
-            TimeSpan expiration = EffectiveExpiration(options);
-            int maxLen = HybridCachePayload.GetMaxBytes(key, tagArray, checked((int)writer.Length));
-            byte[] oversized = System.Buffers.ArrayPool<byte>.Shared.Rent(maxLen);
-            try
-            {
-                int len = HybridCachePayload.Write(oversized, key, NowTicks, expiration, tagArray, writer.WrittenSequence);
-                await db.StringSetAsync(EntryKey(key), new ReadOnlyMemory<byte>(oversized, 0, len), expiration).ConfigureAwait(false);
-            }
-            finally
-            {
-                System.Buffers.ArrayPool<byte>.Shared.Return(oversized);
-            }
-        }
-        catch (ArgumentException)
-        {
-            throw; // caller error (bad tags): surface it
-        }
-        catch (Exception ex)
-        {
-            // write failures are logged and swallowed (matching stock): the caller still has the value
-            _logger.LogError(ex, "Cache backend write failure.");
-        }
     }
 }
