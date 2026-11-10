@@ -5,6 +5,10 @@
     <UseMicrosoftTestingPlatformRunner>true</UseMicrosoftTestingPlatformRunner>
     <TestingPlatformDotnetTestSupport>true</TestingPlatformDotnetTestSupport>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <!-- signed with the shared key so the (signed) library can grant InternalsVisibleTo -->
+    <SignAssembly>true</SignAssembly>
+    <!-- xUnit1051: suites ported from dotnet/extensions predate TestContext token plumbing -->
+    <NoWarn>$(NoWarn);xUnit1051;CA1852</NoWarn><!-- CA1852: TypeTests deliberately uses unsealed types -->
   </PropertyGroup>
 
   <ItemGroup>

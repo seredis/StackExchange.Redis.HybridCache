@@ -111,7 +111,55 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
                 ? factory(state, cancellationToken) : default;
         }
 
+        if ((flags & HybridCacheEntryFlags.DisableDistributedCacheRead) != 0)
+        {
+            // no backend read: go straight to the shared operation, synchronously - this mirrors
+            // stock (and lets non-cancellable callers of immutable types share the final task)
+            return JoinOrCreateStampede(key, state, factory, options, tags, flags, canBeCanceled, readPerformed: false, cancellationToken);
+        }
+
         return GetOrCreateCoreAsync(key, state, factory, options, tags, flags, canBeCanceled, cancellationToken);
+    }
+
+    private ValueTask<T> JoinOrCreateStampede<TState, T>(
+        string key,
+        TState state,
+        Func<TState, CancellationToken, ValueTask<T>> factory,
+        HybridCacheEntryOptions? options,
+        IEnumerable<string>? tags,
+        HybridCacheEntryFlags flags,
+        bool canBeCanceled,
+        bool readPerformed,
+        CancellationToken cancellationToken)
+    {
+        bool isNew = GetOrCreateStampedeState<TState, T>(key, flags, out StampedeState<TState, T> stampede, canBeCanceled, tags, out bool newStateCanSkipRead);
+        if (!isNew)
+        {
+            if (HybridCacheEventSource.Log.IsEnabled())
+            {
+                HybridCacheEventSource.Log.StampedeJoin();
+            }
+
+            return stampede.JoinAsync(_logger, cancellationToken);
+        }
+
+        // we own this stampede and must dispatch the factory; the creating caller's own fresh miss
+        // means the stampede need not re-read the backend, unless creation was contested (see the
+        // Stampede partial)
+        bool skipInitialRead = readPerformed && newStateCanSkipRead;
+
+        if (canBeCanceled)
+        {
+            // *we* might cancel, but someone else might be depending on the result; start the
+            // work independently, then join the outcome
+            stampede.QueueUserWorkItem(state, factory, options, skipInitialRead);
+            return stampede.JoinAsync(_logger, cancellationToken);
+        }
+
+        // we're going to run to completion; no need to get complicated
+        _ = stampede.ExecuteDirectAsync(state, factory, options, skipInitialRead); // this larger task includes the backend write etc
+
+        return stampede.UnwrapReservedAsync(_logger);
     }
 
     private async ValueTask<T> GetOrCreateCoreAsync<TState, T>(
@@ -130,83 +178,52 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
         // is the equivalent of the stock implementation's L1 hit, costing no stampede allocation.
         // (The in-stampede read only runs for the rare contested-creation path; see the stampede
         // partials.)
-        bool readPerformed = false;
-        if ((flags & HybridCacheEntryFlags.DisableDistributedCacheRead) == 0)
-        {
-            readPerformed = true;
 
-            // overlap the wildcard-invalidation read (needed to validate any payload) with the entry read
-            Task<long> wildcard = GetTagInvalidationTicksAsync(WildcardTag);
+        // overlap the wildcard-invalidation read (needed to validate any payload) with the entry read
+        Task<long> wildcard = GetTagInvalidationTicksAsync(WildcardTag);
 
-            BufferChunk blob = default;
-            try
-            {
-                if (eventSourceEnabled)
-                {
-                    HybridCacheEventSource.Log.DistributedCacheGet();
-                }
-
-                blob = await GetFromBackendAsync(key, flags).ConfigureAwait(false);
-                if (eventSourceEnabled)
-                {
-                    if (blob.HasValue)
-                    {
-                        HybridCacheEventSource.Log.DistributedCacheHit();
-                    }
-                    else
-                    {
-                        HybridCacheEventSource.Log.DistributedCacheMiss();
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                if (eventSourceEnabled)
-                {
-                    HybridCacheEventSource.Log.DistributedCacheFailed();
-                }
-
-                // includes WRONGTYPE from a foreign (e.g. stock hash) entry: a logged miss, never an error
-                _logger.CacheUnderlyingDataQueryFailure(ex);
-            }
-
-            if (blob.HasValue
-                && TryGetPayload(blob.AsArraySegment(), key, out HybridCachePayload.Parsed parsed)
-                && await AreTagsCurrentAsync(parsed.CreationTime, parsed.Tags, wildcard).ConfigureAwait(false)
-                && TryDeserialize(parsed.Payload, out T value))
-            {
-                return value;
-            }
-        }
-
-        // miss: join or create the shared operation for this (key, flags)
-        bool isNew = GetOrCreateStampedeState<TState, T>(key, flags, out StampedeState<TState, T> stampede, canBeCanceled, tags, out bool newStateCanSkipRead);
-        if (!isNew)
+        BufferChunk blob = default;
+        try
         {
             if (eventSourceEnabled)
             {
-                HybridCacheEventSource.Log.StampedeJoin();
+                HybridCacheEventSource.Log.DistributedCacheGet();
             }
 
-            return await stampede.JoinAsync(_logger, cancellationToken).ConfigureAwait(false);
+            blob = await GetFromBackendAsync(key, flags).ConfigureAwait(false);
+            if (eventSourceEnabled)
+            {
+                if (blob.HasValue)
+                {
+                    HybridCacheEventSource.Log.DistributedCacheHit();
+                }
+                else
+                {
+                    HybridCacheEventSource.Log.DistributedCacheMiss();
+                }
+            }
         }
-
-        // we own this stampede and must dispatch the factory; our own fresh miss means the
-        // stampede need not re-read the backend, unless creation was contested (see Stampede partial)
-        bool skipInitialRead = readPerformed && newStateCanSkipRead;
-
-        if (canBeCanceled)
+        catch (Exception ex)
         {
-            // *we* might cancel, but someone else might be depending on the result; start the
-            // work independently, then join the outcome
-            stampede.QueueUserWorkItem(state, factory, options, skipInitialRead);
-            return await stampede.JoinAsync(_logger, cancellationToken).ConfigureAwait(false);
+            if (eventSourceEnabled)
+            {
+                HybridCacheEventSource.Log.DistributedCacheFailed();
+            }
+
+            // includes WRONGTYPE from a foreign (e.g. stock hash) entry: a logged miss, never an error
+            _logger.CacheUnderlyingDataQueryFailure(ex);
         }
 
-        // we're going to run to completion; no need to get complicated
-        _ = stampede.ExecuteDirectAsync(state, factory, options, skipInitialRead); // this larger task includes the backend write etc
+        if (blob.HasValue
+            && TryGetPayload(blob.AsArraySegment(), key, out HybridCachePayload.Parsed parsed)
+            && await AreTagsCurrentAsync(parsed.CreationTime, parsed.Tags, wildcard).ConfigureAwait(false)
+            && TryDeserialize(parsed.Payload, out T value))
+        {
+            return value;
+        }
 
-        return await stampede.UnwrapReservedAsync(_logger).ConfigureAwait(false);
+        // miss: join or create the shared operation for this (key, flags)
+        return await JoinOrCreateStampede(key, state, factory, options, tags, flags, canBeCanceled, readPerformed: true, cancellationToken).ConfigureAwait(false);
     }
 
     /// <inheritdoc />
