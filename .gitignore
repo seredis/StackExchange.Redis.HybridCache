@@ -10,3 +10,7 @@ TestResults/
 .idea/
 *.binlog
 .DS_Store
+*.nupkg
+nupkgs/
+BenchmarkDotNet.Artifacts/
+launchSettings.json
