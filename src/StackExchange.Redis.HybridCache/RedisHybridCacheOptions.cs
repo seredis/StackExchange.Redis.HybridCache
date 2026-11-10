@@ -1,6 +1,6 @@
 using Microsoft.Extensions.Caching.Hybrid;
 
-namespace StackExchange.Redis.Hybrid;
+namespace StackExchange.Redis.HybridCache;
 
 /// <summary>
 /// Options for <see cref="RedisHybridCache"/>.
@@ -8,18 +8,14 @@ namespace StackExchange.Redis.Hybrid;
 public sealed class RedisHybridCacheOptions
 {
     /// <summary>
-    /// The prefix applied to every key this cache stores in redis. This should also appear in
-    /// the multiplexer's <c>CacheOptions.Prefixes</c>, so that reads are tracked and stored on
-    /// first miss (<c>TrackingByPrefix</c>); with other tracking modes, per-call
+    /// The prefix applied to every key this cache stores in redis. For wire compatibility with
+    /// the default <c>HybridCache</c> implementation over the redis <c>IDistributedCache</c>,
+    /// this plays the role of (and must match) that cache's <c>InstanceName</c>. It should also
+    /// appear in the multiplexer's <c>CacheOptions.Prefixes</c>, so that reads are tracked and
+    /// stored on first miss (<c>TrackingByPrefix</c>); with other tracking modes, per-call
     /// <c>CommandFlags.CacheOptIn</c> is used instead.
     /// </summary>
-    public string KeyPrefix { get; set; } = "hc:";
-
-    /// <summary>
-    /// The prefix for per-tag invalidation-epoch keys; must fall under a tracked prefix for
-    /// tag checks to be served from local memory.
-    /// </summary>
-    public string TagPrefix { get; set; } = "hc:t:";
+    public string KeyPrefix { get; set; } = "";
 
     /// <summary>
     /// Default options applied to entries when the caller supplies none.

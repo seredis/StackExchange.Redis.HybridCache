@@ -1,7 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <TargetFrameworks>netstandard2.0;net8.0;net10.0</TargetFrameworks>
-    <RootNamespace>StackExchange.Redis.Hybrid</RootNamespace>
     <Description>HybridCache built natively on StackExchange.Redis server-assisted client-side caching: one near cache, push invalidation, stampede protection.</Description>
     <PackageTags>redis;cache;hybridcache;client-side-caching;invalidation</PackageTags>
     <IsPackable>true</IsPackable>

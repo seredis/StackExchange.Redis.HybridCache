@@ -4,7 +4,7 @@ using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using StackExchange.Redis;
-using StackExchange.Redis.Hybrid;
+using StackExchange.Redis.HybridCache;
 
 namespace Microsoft.Extensions.DependencyInjection;
 

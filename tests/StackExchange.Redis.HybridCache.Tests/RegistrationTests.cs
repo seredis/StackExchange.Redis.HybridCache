@@ -1,10 +1,10 @@
 using System;
-using Microsoft.Extensions.Caching.Hybrid;
 using Microsoft.Extensions.DependencyInjection;
-using StackExchange.Redis.Hybrid;
 using Xunit;
 
-namespace StackExchange.Redis.Hybrid.Tests;
+using HybridCacheBase = Microsoft.Extensions.Caching.Hybrid.HybridCache;
+
+namespace StackExchange.Redis.HybridCache.Tests;
 
 public class RegistrationTests
 {
@@ -12,8 +12,7 @@ public class RegistrationTests
     public void OptionsHaveDocumentedDefaults()
     {
         var options = new RedisHybridCacheOptions();
-        Assert.Equal("hc:", options.KeyPrefix);
-        Assert.Equal("hc:t:", options.TagPrefix);
+        Assert.Equal("", options.KeyPrefix);
         Assert.Equal(1 << 20, options.MaximumPayloadBytes);
         Assert.Equal(1024, options.MaximumKeyLength);
     }
@@ -25,7 +24,7 @@ public class RegistrationTests
             .AddRedisHybridCache()
             .BuildServiceProvider();
 
-        var ex = Assert.Throws<InvalidOperationException>(() => { _ = provider.GetRequiredService<HybridCache>(); });
+        var ex = Assert.Throws<InvalidOperationException>(() => { _ = provider.GetRequiredService<HybridCacheBase>(); });
         Assert.Contains("IConnectionMultiplexer", ex.Message);
     }
 }

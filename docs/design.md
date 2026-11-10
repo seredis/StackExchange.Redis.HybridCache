@@ -61,7 +61,7 @@ Source: `src/Libraries/Microsoft.Extensions.Caching.Hybrid/Internal/` in
 | `DefaultHybridCache.L2.cs` | `IDistributedCache`/`IBufferDistributedCache` read/write. | **Drop**; replaced by direct SE.Redis calls. |
 | `DefaultHybridCache.TagInvalidation.cs`, `TagSet.cs` | Per-tag invalidation timestamps (`ConcurrentDictionary<string, Task<long>>` locally, special keys in L2); an entry is valid iff its creation timestamp is newer than every one of its tags' invalidation timestamps, and the `*` wildcard timestamp. | **Fork `TagSet`; rebuild the timestamp store on redis + CSC** — this is where the design gets strictly better, below. |
 | `DefaultHybridCache.Serialization.cs`, `DefaultJsonSerializerFactory`, `InbuiltTypeSerializer`, `ImmutableTypeCache*` | Serializer resolution (per-type, factories, inbuilt `string`/`byte[]`, STJ fallback), immutability detection (`sealed` + `[ImmutableObject(true)]`). | **Fork as-is.** |
-| `HybridCachePayload.cs` | L2 envelope: key echo, tags + creation time, flags, checksum — protects against case-insensitive backends, truncation, and carries what tag validation needs. | **Fork; keep wire-compatible if interop stays a goal** (open question). |
+| `HybridCachePayload.cs` | L2 envelope: key echo, tags + creation time, flags, checksum — protects against case-insensitive backends, truncation, and carries what tag validation needs. | **Fork byte-for-byte; wire compatibility is a goal** (decided — see interop section). |
 | `BufferChunk`, `RecyclableArrayBufferWriter` | Pooled buffer plumbing. | Fork what the stampede/serialization code needs; prefer SE.Redis v4's own lease types (`Lease<byte>`, `ReadOnlyLease<T>`) at the boundary. |
 | `HybridCacheEventSource.cs`, `Log.cs` | Metrics/logging. | Fork shape, rename sources. |
 
@@ -107,12 +107,12 @@ caller
 stampede layer (forked from DefaultHybridCache; per-process query combination)
   │  miss / join
   ▼
-redis read path:  db.Strings.GetLeaseAsync(hc:key, CacheOptIn)
+redis read path:  tracked read of the entry (compat representation, below), CacheOptIn
   │         ▲
   │         └── SE.Redis client-side cache = the ONLY near cache (serialized payload,
   │             invalidated by server push; RefreshAfter / grace windows apply)
   ▼
-redis / factory:  miss ⇒ run factory ⇒ serialize ⇒ SET hc:key PX <Expiration> ⇒ return
+redis / factory:  miss ⇒ run factory ⇒ serialize ⇒ store + TTL (compat representation) ⇒ return
 ```
 
 - **One near cache, not two.** The CSC holds the serialized payload. There is no `IMemoryCache`.
@@ -148,40 +148,69 @@ redis / factory:  miss ⇒ run factory ⇒ serialize ⇒ SET hc:key PX <Expirati
   a documented gap. (Local read-your-writes is immediate — the multiplexer invalidates before
   the DEL is sent; remote processes see it "shortly after", per CSC consistency semantics.)
 
-### Tags: cached counters instead of local clocks
+### Tags: the stock timestamp scheme, made coherent by the client cache
 
-`RemoveByTagAsync` stays logical (nothing is physically deleted), but the timestamp store moves
-into redis keys that are themselves client-side cached:
+**Decision: wire compatibility with the default implementation is a goal** (same serializer
+configured ⇒ mixed fleets can share entries during migration). That pins the tag design to the
+stock scheme — per-tag invalidation *timestamps*, entries valid iff created after every relevant
+tag's timestamp — rather than anything bespoke. What changes is where the near copy of those
+timestamps lives and how it is kept fresh:
 
-- Each tag gets a key, e.g. `hc:t:<tag>` (and `hc:t:*` for the wildcard), holding an
-  **invalidation epoch**.
-- `RemoveByTagAsync(tag)` ⇒ `INCR hc:t:<tag>`. The write invalidates the cached copy in every
-  client via tracking push — so *tag invalidation is coherent across the whole fleet within the
-  push latency*, not "this server plus whoever's L1 expires".
-- Entry validation: the payload stores, per tag, the epoch observed when the entry was created;
-  an entry is valid iff every tag's current epoch equals the stored one. Reading the current
-  epochs is a client-cache hit (local memory) in the steady state — the first read after an
-  invalidation is the only round trip, once per process.
-- **Why counters, not clocks**: the stock implementation compares *timestamps* across machines
-  (entry created on server A, tag invalidated from server B, compared on server C), which is
-  exactly the comparison wall-clocks are bad at. Monotonic per-tag counters in redis remove
-  clocks from the correctness argument entirely. Race-safety: capture the epochs *before*
-  running the factory; a `RemoveByTag` that lands while the factory runs bumps the epoch and the
-  new entry is born invalid — correct, and the same guarantee the MS implementation gets from
-  `isNow` timestamps, without the skew.
-- Cost: a miss reads N tag keys (pipelined individual GETs — tag keys won't share a cluster
-  hash slot, so no MGET); all are locally cached afterwards. A hit validates against local
-  memory only.
-- The epoch keys get no TTL by default (they are tiny); an optional long TTL plus "missing key
-  ⇒ epoch 0" keeps abandoned tags from accumulating (needs care: expiry is not announced, but
-  CSC `TimeToLive` bounds the cached copy, and a *re-created* key starting at 0 must not
-  resurrect old entries — store `(generation, counter)` or just never expire; open question).
+- `DefaultHybridCache` stores each tag's invalidation time in L2 at `__MSFT_HCT__<tag>`
+  (8-byte little-endian UTC ticks) and memoizes it locally with no cross-server refresh signal.
+- Here, those same keys fall inside the tracked prefix, so every process holds the timestamp in
+  its client cache; `RemoveByTagAsync` writes the key and the tracking push drops every cached
+  copy — *tag invalidation is coherent across the whole fleet within the push latency*, not
+  "this server plus whoever's L1 expires". Steady-state tag validation is a local-memory read;
+  the first read after an invalidation is the only round trip, once per process.
+- Cost on a miss: N tag-key reads (pipelined individual GETs — tag keys won't share a cluster
+  hash slot, so no MGET); all locally cached afterwards.
+- **Clock skew is accepted**, as it is in the stock implementation (entry created on server A,
+  tag invalidated from B, compared on C). A monotonic per-tag *counter* scheme would remove
+  clocks from the correctness argument entirely and was the original sketch here, but it cannot
+  be read or honoured by `DefaultHybridCache` instances sharing the data, so interop wins.
+  (Revisit only if interop is ever dropped.) Race-safety is the stock behaviour: timestamps are
+  captured such that a `RemoveByTag` landing while a factory runs invalidates the new entry.
+- Tag-key lifecycle follows the stock implementation (it writes them with its
+  `_tagInvalidationEntryOptions`; match whatever TTL that implies so neither side resurrects the
+  other's tags).
+
+### Interop with the default implementation (decided: yes)
+
+Mixed fleets — some servers on `DefaultHybridCache` + redis `IDistributedCache`, some on
+SE.Hybrid — should read and write each other's entries, given the same serializer
+configuration. Three layers must match:
+
+1. **Payload envelope**: fork `HybridCachePayload` byte-for-byte. Format v1/v2: sentinel
+   (`0x03`) + version, 2 bytes entropy, 8 bytes creation time (UTC ticks, LE); then varint
+   flags, payload size, duration (ticks relative to creation), optional local-size (v2), tag
+   count, varint+utf8 key echo, varint+utf8 tags, payload bytes, trailing sentinel+version;
+   all bytes must be exhausted. Write v1 unless a local-size override is persisted, like the
+   stock writer.
+2. **Tag timestamp keys**: `__MSFT_HCT__<tag>`, 8-byte LE UTC ticks — see the tags section.
+3. **The redis representation `Microsoft.Extensions.Caching.StackExchangeRedis` uses**: keys
+   prefixed with `InstanceName`, and each entry stored as a *hash* (`absexp`/`sldexp`/`data`
+   fields, with the envelope in `data`) plus a key TTL — verify the exact current layout
+   (it has shifted across versions, including the `IBufferDistributedCache` path) and pin it
+   with round-trip tests against the real packages. `RedisHybridCacheOptions.KeyPrefix`
+   therefore plays the role of, and must match, `InstanceName` (default: empty, matching
+   `RedisCacheOptions`). Hash reads (`HMGET`) are tracked and invalidated like any other keyed
+   read, so none of this costs the client cache anything.
+4. **Serialization config surface**: mirror the stock builder's registration shape
+   (`AddSerializer<T, TImpl>()`, `AddSerializerFactory<TFactory>()`) over the same abstractions
+   interfaces (`IHybridCacheSerializer<T>`, `IHybridCacheSerializerFactory`), so the "same
+   serializer configured" precondition is a copy-paste of the existing registrations. The
+   builder interface itself (`IHybridCacheBuilder`) lives in the implementation package, not
+   abstractions, so SE.Hybrid defines its own equivalent.
+
+Interop test matrix (phase 2): stock-writes/SE.Hybrid-reads and the reverse, for plain entries,
+tagged entries, `RemoveAsync`, `RemoveByTagAsync` from each side, and the `*` wildcard.
 
 ### Entry options and flags, mapped
 
 | contract | mapping |
 |---|---|
-| `Expiration` | redis TTL: `SET hc:key <payload> PX <ms>`. The source of truth; shared by the fleet. |
+| `Expiration` | redis TTL on the stored entry (and `absexp` in the compat representation). The source of truth; shared by the fleet. |
 | `LocalCacheExpiration` | CSC bound: per-read `WithMaxCacheAge(localExpiration)` context (can only tighten the cache-wide `TimeToLive`). Cache-wide default comes from `CachePolicy.TimeToLive`. Note semantics shift: stock = "how long L1 keeps it"; here = "how stale a near-copy I will accept", with push invalidation making the practical staleness far smaller. |
 | `DisableLocalCacheRead` | `CommandFlags.CacheOptOut` on the GET (note: also skips storing; CSC cannot currently express "don't read the cache but do store the reply" — acceptable, flag as SE.Redis nice-to-have). |
 | `DisableLocalCacheWrite` | `CacheOptOut` likewise (same caveat, mirrored). |
@@ -194,7 +223,8 @@ into redis keys that are themselves client-side cached:
 ```csharp
 services.AddRedisHybridCache(options =>
 {
-    options.KeyPrefix = "hc:";          // also the recommended CSC prefix
+    options.KeyPrefix = "myapp:";       // = the IDistributedCache InstanceName for interop;
+                                        // also the recommended CSC tracking prefix
     // DefaultEntryOptions, MaximumPayloadBytes, MaximumKeyLength, serializers...
 });
 ```
@@ -211,6 +241,10 @@ services.AddRedisHybridCache(options =>
 
 What this needs from SE.Redis v4 (candidate API additions)
 ---
+
+v4 is **unreleased and ours**, so gaps found here should be surfaced as v4 API work *now*, while
+the surface is still soft — this project is partly a deliberate stress-test of the client-side
+caching API. Current list:
 
 1. *(phase 2)* **Entry identity on cached reads** — enough to key a deserialized-object memo.
    Smallest viable shape: lease/result exposes an opaque version token stable for the lifetime of
@@ -231,31 +265,38 @@ Phasing
 1. **Skeleton + contract** (this repo, now): project layout, abstractions reference, stub
    `RedisHybridCache`, DI, options; CI; port of the stampede machinery with the redis backend
    stubbed; unit tests against a fake backend.
-2. **Redis backend**: GET/SET/DEL path, payload envelope, serializers, options/flags mapping;
-   integration tests against real redis (mirror SE.Redis test infra); tag epochs.
+2. **Redis backend**: read/write/delete path in the compat representation, payload envelope,
+   serializers, options/flags mapping; tag timestamps; integration tests against real redis
+   (mirror SE.Redis test infra) including the interop matrix against the real Microsoft
+   packages. Raise any SE.Redis v4 API gaps found here immediately — v4 is still soft.
 3. **Perf + the deserialized layer**: benchmarks vs stock `DefaultHybridCache`+SE.Redis CSC;
-   entry-identity memo if the SE.Redis hook lands.
+   entry-identity memo (the SE.Redis hook should be prototyped on the v4 branch during phase 2,
+   not after).
 4. **Hardening**: cluster, connection groups, `KeyspaceNotifications`/degraded modes, metrics
    parity, docs.
+
+Decisions so far
+---
+
+- **Naming**: `StackExchange.Redis.HybridCache` for package, assembly *and* namespace (the
+  namespace segment shadows the `HybridCache` type name inside our own namespace; handled with a
+  file-level alias, a nuisance worth the consistency).
+- **Interop**: wire-compatible with the default implementation (payload envelope, tag timestamp
+  keys, redis representation, serializer config surface) — see the interop section. Consequence:
+  timestamp-based tag validation, clock skew accepted as in stock.
+- **TFMs**: `netstandard2.0;net8.0;net10.0`; no explicit net472 for now — revisit if a netfx
+  audience shows up (ns2.0 keeps the door open).
+- **Licensing/attribution**: dotnet/extensions is MIT; forked files keep their copyright header
+  plus a provenance note, and `THIRD-PARTY-NOTICES.md` carries the notice (same pattern SE.Redis
+  uses). (Trivially fine in this case — same original author — but kept for hygiene.)
 
 Open questions
 ---
 
-- **Naming.** Repo is `SE.Hybrid`. Skeleton uses PackageId/assembly
-  `StackExchange.Redis.HybridCache` (discoverable) with root namespace
-  `StackExchange.Redis.Hybrid` (avoids a namespace segment colliding with the `HybridCache`
-  type name). Both easily changed now, painful later.
-- **Payload interop** with `DefaultHybridCache`'s `HybridCachePayload` format: wire-compatible
-  (mixed fleets during migration can share entries; must then keep *timestamp*-based tag
-  validation for compatibility) vs clean break (counters, simpler envelope). Current lean:
-  clean break; migration is "two prefixes for a while", staleness bounded by TTLs.
-- **Tag-epoch key lifecycle** (TTL vs permanent; resurrection safety) — see above.
 - **Strong-name signing**: SE.Redis signs; new key vs none for this package.
-- **TFMs**: skeleton says `netstandard2.0;net8.0;net10.0` (abstractions supports ns2.0; SE.Redis
-  v4 ships ns2.0 + net472 + net461). Add net472 if netfx is a real audience for *this* package.
-- **Licensing/attribution**: dotnet/extensions is MIT; forked files keep their copyright header
-  plus a provenance note, and `THIRD-PARTY-NOTICES.md` carries the notice (same pattern SE.Redis
-  uses).
+- **Exact current `Microsoft.Extensions.Caching.StackExchangeRedis` layout** (hash fields,
+  `IBufferDistributedCache` path, sliding-expiration touch behaviour) — pin with round-trip
+  tests against the real packages before freezing the backend.
 - **`IDistributedCache`/`IBufferDistributedCache` bridge**: also implement them (cheap, from the
   same backend) so SE.Hybrid can serve code that still asks for `IDistributedCache`? Lean: no,
   out of scope; stay focused.
