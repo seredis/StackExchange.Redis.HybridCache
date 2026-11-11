@@ -32,6 +32,11 @@ sealed class CatalogService(string name, HybridCache cache, Database database)
         await cache.SetAsync($"product/{product.Id}", product, tags: ["catalog"], cancellationToken: cancellationToken);
     }
 
+    /// <summary>An eviction: the cached entry is wrong (say the database was changed directly);
+    /// remove it everywhere and let the next read reload it.</summary>
+    public async ValueTask RemoveProductAsync(int id, CancellationToken cancellationToken = default)
+        => await cache.RemoveAsync($"product/{id}", cancellationToken);
+
     /// <summary>A bulk change (think: a new price list just imported): every cached product is now wrong.</summary>
     public async ValueTask InvalidateCatalogAsync(CancellationToken cancellationToken = default)
         => await cache.RemoveByTagAsync("catalog", cancellationToken);
