@@ -188,7 +188,7 @@ public sealed partial class RedisHybridCache
                             HybridCacheEventSource.Log.DistributedCacheGet();
                         }
 
-                        result = await Cache.GetFromBackendAsync(Key.Key, activeFlags).ConfigureAwait(false);
+                        result = await Cache.GetFromBackendAsync(Key.Key, activeFlags, _options).ConfigureAwait(false);
                         if (eventSourceEnabled)
                         {
                             if (result.HasValue)

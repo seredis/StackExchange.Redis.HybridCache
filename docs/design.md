@@ -360,8 +360,11 @@ Phasing
 > (BCL issue - we use a plain loop); the fault-injection tests now disable commands via
 > `CommandMap` (an `IDatabase`-level proxy never sees context-API traffic). Follow-up spotted
 > during this work: `RespDatabaseContext.WithMaxCacheAge` is read-time and public, so
-> `LocalCacheExpiration` is now honourable (memoize a context per distinct value) - the
-> documented divergence below can be retired when that lands.
+> `LocalCacheExpiration` is now honourable (memoize a context per distinct value) - **landed
+> 2026-11-11 (issue #2)**: entry reads take a memoized `WithMaxCacheAge` context when the
+> effective local expiration is strictly tighter than the backend expiration (equal-or-wider
+> is subsumed by the envelope's creation-based expiry check), and the divergence in
+> parity-plan.md is retired. Bounded hits remain allocation-free (asserted).
 >
 > **Status (2026-11-10, post-parity)**: feature parity with the stock `DefaultHybridCache` is
 > implemented per [parity-plan.md](parity-plan.md) — stampede combining (full port, incl.

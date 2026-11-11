@@ -58,6 +58,7 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
     private readonly HybridCacheEntryFlags _hardFlags; // *always* present (none today: the backend is mandatory)
     private readonly HybridCacheEntryFlags _defaultFlags; // note this already includes hardFlags
     private readonly TimeSpan _defaultExpiration;
+    private readonly TimeSpan _defaultLocalCacheExpiration;
     private readonly int _maximumKeyLength;
 
     internal RedisHybridCache(
@@ -79,6 +80,7 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
         _hardFlags = HybridCacheEntryFlags.None;
         _defaultFlags = (defaultEntryOptions?.Flags ?? HybridCacheEntryFlags.None) | _hardFlags;
         _defaultExpiration = defaultEntryOptions?.Expiration ?? TimeSpan.FromMinutes(DefaultExpirationMinutes);
+        _defaultLocalCacheExpiration = GetEffectiveLocalCacheExpiration(defaultEntryOptions) ?? _defaultExpiration;
     }
 
     internal RedisHybridCacheOptions Options => _options;
@@ -240,7 +242,7 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
         ValueTask<BufferChunk> pendingRead;
         try
         {
-            pendingRead = GetFromBackendAsync(key, flags);
+            pendingRead = GetFromBackendAsync(key, flags, options);
         }
         catch (Exception ex)
         {

@@ -60,7 +60,14 @@ Divergences to assert in tests (deliberate, documented)
 - Immutable types are *not* reference-shared across separate `GetOrCreateAsync` calls (no
   deserialized-object memo until the v4 entry-identity hook); they *are* shared among callers
   joined to one stampede. Semantically invisible for genuinely immutable types.
-- `LocalCacheExpiration` is not honoured locally (see #5).
+- ~~`LocalCacheExpiration` is not honoured locally (see #5).~~ **Retired (2026-11-11, issue #2)**:
+  honoured via memoized `WithMaxCacheAge` read contexts when the effective local expiration
+  (stock resolution: `LocalCacheExpiration ?? Expiration`, per options object) is strictly
+  tighter than the backend expiration; equal-or-wider bounds are already subsumed by the
+  envelope's creation-based expiry check. Note the semantics remain read-time ("how stale a
+  near copy I will accept") rather than store-time ("how long L1 keeps it") — same base
+  instant (the local store), same bound, but the copy is refetched on demand rather than
+  evicted on a timer.
 - L1-specific events (`LocalCacheHit`/`Miss`/`Write`) are not emitted (see #10).
 
 Test inheritance (from `Microsoft.Extensions.Caching.Hybrid.Tests`)

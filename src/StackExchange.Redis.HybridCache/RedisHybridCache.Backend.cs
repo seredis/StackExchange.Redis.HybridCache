@@ -18,6 +18,7 @@
 using System;
 using System.Buffers;
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
@@ -42,6 +43,10 @@ public sealed partial class RedisHybridCache
     // stampede-only paths never need a backend at all)
     private RespContext? _rawContext;
     private int _configurationChecked;
+
+    // memoized read-time freshness bounds (one derived context per distinct LocalCacheExpiration:
+    // WithMaxCacheAge allocates, and hits must not); created on first use, benign race as above
+    private ConcurrentDictionary<TimeSpan, RespContext>? _maxAgeContexts;
 
     private static ReadOnlySpan<byte> TagKeyInfixUtf8 => "__SER_HCT__"u8;
 
@@ -140,11 +145,45 @@ public sealed partial class RedisHybridCache
     private static CommandFlags ReadCommandFlags(HybridCacheEntryFlags flags)
         => (flags & HybridCacheEntryFlags.DisableLocalCache) == 0 ? CommandFlags.CacheOptIn : CommandFlags.CacheOptOut;
 
-    internal ValueTask<BufferChunk> GetFromBackendAsync(string key, HybridCacheEntryFlags flags)
-        => Context.SendAsync($"{_get}{new RespKey(key)}", ReadCommandFlags(flags), PooledBlobHandler.Instance);
+    internal ValueTask<BufferChunk> GetFromBackendAsync(string key, HybridCacheEntryFlags flags, HybridCacheEntryOptions? options)
+        => ReadContext(options).SendAsync($"{_get}{new RespKey(key)}", ReadCommandFlags(flags), PooledBlobHandler.Instance);
 
-    internal ValueTask<BufferChunk> GetFromBackendAsync(ReadOnlySpan<char> key, HybridCacheEntryFlags flags)
-        => Context.SendAsync($"{_get}{new RespKey(key)}", ReadCommandFlags(flags), PooledBlobHandler.Instance);
+    internal ValueTask<BufferChunk> GetFromBackendAsync(ReadOnlySpan<char> key, HybridCacheEntryFlags flags, HybridCacheEntryOptions? options)
+        => ReadContext(options).SendAsync($"{_get}{new RespKey(key)}", ReadCommandFlags(flags), PooledBlobHandler.Instance);
+
+    /// <summary>
+    /// The context for an entry read: the plain context, or - when the effective
+    /// <see cref="HybridCacheEntryOptions.LocalCacheExpiration"/> is strictly tighter than the
+    /// backend expiration - a memoized context bounded by <c>WithMaxCacheAge</c>, so a locally
+    /// cached copy older than the local expiration is refetched rather than served. The
+    /// envelope's own expiry check already bounds staleness at the (creation-based, so tighter)
+    /// backend expiration, which is why an equal-or-wider local bound adds nothing and takes
+    /// the plain context; that keeps the common no-options path at zero cost.
+    /// </summary>
+    private RespDatabaseContext ReadContext(HybridCacheEntryOptions? options)
+    {
+        TimeSpan local = GetEffectiveLocalCacheExpiration(options) ?? _defaultLocalCacheExpiration;
+        return local < GetBackendExpiration(options) ? MaxAgeContext(local) : Context;
+    }
+
+    private RespDatabaseContext MaxAgeContext(TimeSpan maxAge)
+    {
+        ConcurrentDictionary<TimeSpan, RespContext> contexts = _maxAgeContexts ??= new();
+        if (!contexts.TryGetValue(maxAge, out RespContext? context))
+        {
+            // the value overload, not a factory lambda: GetOrAdd(key, factory) allocates the
+            // delegate per call, and this runs on the hit path
+            context = contexts.GetOrAdd(maxAge, (RespContext)Context.WithMaxCacheAge(maxAge));
+        }
+
+        return new(context);
+    }
+
+    // mirrors stock (DefaultHybridCache.GetEffectiveLocalCacheExpiration): within one options
+    // object, LocalCacheExpiration inherits from Expiration, so that a caller who only sets
+    // Expiration keeps the two in sync rather than silently keeping a stale default local bound
+    private static TimeSpan? GetEffectiveLocalCacheExpiration(HybridCacheEntryOptions? options)
+        => options is null ? null : options.LocalCacheExpiration ?? options.Expiration;
 
     internal async ValueTask SetBackendAsync(string key, CacheItem item, BufferChunk payload, HybridCacheEntryOptions? options)
     {

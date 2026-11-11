@@ -186,6 +186,47 @@ public class SpanKeyTests : IClassFixture<RedisFixture>
         Assert.Equal(0, delta);
     }
 
+    [Fact]
+    public async Task BoundedLocalExpirationHits_DoNotAllocate()
+    {
+        Assert.SkipWhen(_fx.CachedConnection is null, _fx.CachedSkipReason);
+        Assert.SkipWhen(HybridCacheEventSource.Log.IsEnabled(), "EventSource listener active (parallel EventSource tests); counters would attribute allocations to this thread");
+
+        await using var provider = CreateProvider(_fx.CachedConnection!, RedisFixture.NewPrefix(), rawIntSerializer: true);
+        var cache = provider.GetRequiredService<HybridCacheBase>();
+
+        // a tighter-than-backend local bound routes reads through the memoized WithMaxCacheAge
+        // context; the derived context must be built once, not per call
+        var options = new HybridCacheEntryOptions
+        {
+            Expiration = TimeSpan.FromMinutes(5),
+            LocalCacheExpiration = TimeSpan.FromSeconds(30),
+        };
+
+        string key = "zeroalloc/bounded";
+        Func<CancellationToken, ValueTask<int>> factory = _ => new(42);
+
+        for (int i = 0; i < 10; i++)
+        {
+            Assert.Equal(42, await cache.GetOrCreateAsync(key, factory, options, cancellationToken: TestContext.Current.CancellationToken));
+        }
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        int wrong = 0;
+        for (int i = 0; i < 1_000; i++)
+        {
+            if (await cache.GetOrCreateAsync(key, factory, options, cancellationToken: TestContext.Current.CancellationToken) != 42)
+            {
+                wrong++;
+            }
+        }
+
+        long delta = GC.GetAllocatedBytesForCurrentThread() - before;
+        Assert.SkipWhen(HybridCacheEventSource.Log.IsEnabled(), "EventSource listener became active mid-measurement");
+        Assert.Equal(0, wrong);
+        Assert.Equal(0, delta);
+    }
+
 #if NET10_0_OR_GREATER
     [Fact]
     public async Task InterpolatedKeyHits_DoNotAllocate()
