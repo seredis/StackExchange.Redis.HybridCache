@@ -436,14 +436,19 @@ Decisions so far
 Open questions
 ---
 
-- **Migration read-fallback** (phase 4, optional): build it at all? If so, pin the exact stock
-  `Microsoft.Extensions.Caching.StackExchangeRedis` hash layout (it has shifted across
-  versions, including the `IBufferDistributedCache` path) against the real packages.
-- **`IDistributedCache`/`IBufferDistributedCache` bridge**: also implement them (cheap, from the
-  same backend) so SE.Hybrid can serve code that still asks for `IDistributedCache`? Lean: no,
-  out of scope; stay focused. (Note: if ever built, it must be absolute-expiry-only or use its
-  own representation — sliding is incompatible with the client cache, per the representation
-  section.)
+> **Remaining work is tracked as GitHub issues** (seredis/SE.Hybrid #1–#13, 2026-11-11): contract
+> loose ends (#1 first-use validation, #2 `LocalCacheExpiration`, #3 L1 events, #4
+> `ReportTagMetrics`), the v4-gated items (#5 flag split, #6 deserialized memo, #7 tag
+> memoization/eviction), hardening (#8 cluster, #9 netfx lane, #10 benchmarks, #11 reconnect
+> resilience), and the parked decisions (#12 migration fallback, #13 release mechanics).
+
+- **Migration read-fallback** (phase 4, optional — issue #12): build it at all? If so, pin the
+  exact stock `Microsoft.Extensions.Caching.StackExchangeRedis` hash layout (it has shifted
+  across versions, including the `IBufferDistributedCache` path) against the real packages.
+- ~~**`IDistributedCache`/`IBufferDistributedCache` bridge**~~ — **resolved (2026-11-11): no.**
+  SE.Hybrid is a direct `HybridCache` implementation; the `IDistributedCache` abstraction cannot
+  express the intent here (client-cache coherence, tags, envelope semantics), so a bridge would
+  misrepresent the library. Code that wants `IDistributedCache` should use the stock provider.
 
 References
 ---

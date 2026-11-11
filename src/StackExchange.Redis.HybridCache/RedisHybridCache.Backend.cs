@@ -19,6 +19,7 @@ using System;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Caching.Hybrid;
 using RESPite.Messages;
@@ -40,6 +41,7 @@ public sealed partial class RedisHybridCache
     // call on the multiplexer (DI can register a placeholder that is configured later; the
     // stampede-only paths never need a backend at all)
     private RespContext? _rawContext;
+    private int _configurationChecked;
 
     private static ReadOnlySpan<byte> TagKeyInfixUtf8 => "__SER_HCT__"u8;
 
@@ -57,7 +59,70 @@ public sealed partial class RedisHybridCache
             context = context.AppendKeyPrefix(prefix);
         }
 
+        CheckConfiguration();
         return (RespContext)context;
+    }
+
+    // Degraded configurations work, but must say what they cost (docs/design.md: "validated ...
+    // loudly"); deferred to first backend use for the same reason the context is (see above).
+    private void CheckConfiguration()
+    {
+        if (Interlocked.Exchange(ref _configurationChecked, 1) != 0)
+        {
+            return;
+        }
+
+        Caching.ClientCache? cache = _multiplexer.GetClientCache();
+        if (cache is null || !cache.Options.Enabled)
+        {
+            // no local cache at all: correct, but it is a distributed-only cache - the user
+            // probably wanted the near cache they came here for
+            _logger.ClientCacheNotAvailable();
+            return;
+        }
+
+        Caching.CacheTrackingMode mode = cache.EffectiveTrackingMode;
+        TimeSpan timeToLive = cache.Options.DefaultPolicy.TimeToLive;
+        switch (mode)
+        {
+            case Caching.CacheTrackingMode.None:
+                // no invalidation of any kind: entries AND tag timestamps can be stale up to the TTL
+                _logger.ClientCacheNoServerInvalidation(timeToLive);
+                break;
+            case Caching.CacheTrackingMode.KeyspaceNotifications:
+                // includes the runtime fallback from Default (RESP2, CLIENT disabled, tracking refused)
+                _logger.ClientCacheKeyspaceNotifications(timeToLive);
+                break;
+            default:
+                _logger.ClientCacheValidated(mode);
+                break;
+        }
+
+        // Under Broadcast, KeyspaceNotifications and None the configured prefixes are a hard
+        // boundary: a key outside them is never announced, so it is never stored - our reads
+        // quietly become distributed-only. (The per-key tracking modes need no check: our
+        // per-call CacheOptIn reaches any key there, prefixes or not.)
+        if (mode is Caching.CacheTrackingMode.Broadcast or Caching.CacheTrackingMode.KeyspaceNotifications or Caching.CacheTrackingMode.None
+            && cache.Options.Prefixes is { Count: > 0 } prefixes
+            && !CoversKeyPrefix(prefixes, _options.KeyPrefix))
+        {
+            _logger.ClientCacheKeyPrefixNotCovered(_options.KeyPrefix, mode);
+        }
+    }
+
+    private static bool CoversKeyPrefix(System.Collections.Generic.IReadOnlyList<RedisKey> prefixes, string keyPrefix)
+    {
+        for (int i = 0; i < prefixes.Count; i++)
+        {
+            // every key this cache renders starts with KeyPrefix, so coverage of the prefix
+            // itself is coverage of them all; anything partial is reported as not covered
+            if ((string?)prefixes[i] is { } prefix && keyPrefix.StartsWith(prefix, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static byte[] CreateTagKeyUtf8(string tag)

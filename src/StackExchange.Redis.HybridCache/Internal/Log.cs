@@ -63,6 +63,29 @@ internal static partial class Log
     internal static partial void CacheBackendDataRejected(this ILogger logger, HybridCachePayload.ParseResult reason, Exception? ex);
 
     // SE.Hybrid-specific messages continue from 1000, keeping clear of in-box IDs
-    [LoggerMessage(LogLevel.Error, "Tag invalidation read failure; treating tag as expired.", EventName = "TagInvalidationReadFailure", EventId = 1000)]
+    internal const int IdTagInvalidationReadFailure = 1000;
+    internal const int IdClientCacheNotAvailable = 1001;
+    internal const int IdClientCacheNoServerInvalidation = 1002;
+    internal const int IdClientCacheKeyspaceNotifications = 1003;
+    internal const int IdClientCacheKeyPrefixNotCovered = 1004;
+    internal const int IdClientCacheValidated = 1005;
+
+    [LoggerMessage(LogLevel.Error, "Tag invalidation read failure; treating tag as expired.", EventName = "TagInvalidationReadFailure", EventId = IdTagInvalidationReadFailure)]
     internal static partial void TagInvalidationReadFailure(this ILogger logger, Exception ex);
+
+    // first-use configuration checks: degraded modes work, but must say what they cost (see docs/design.md)
+    [LoggerMessage(LogLevel.Warning, "No client-side cache is configured on the connection; operating as a distributed-only cache (no local caching). Configure ConfigurationOptions.ClientCache (RESP3) on the multiplexer to enable local caching.", EventName = "ClientCacheNotAvailable", EventId = IdClientCacheNotAvailable)]
+    internal static partial void ClientCacheNotAvailable(this ILogger logger);
+
+    [LoggerMessage(LogLevel.Warning, "The client-side cache tracking mode in force is None: there is no server-assisted invalidation, so local staleness (including tag invalidation) is bounded only by the cache TimeToLive ({TimeToLive}).", EventName = "ClientCacheNoServerInvalidation", EventId = IdClientCacheNoServerInvalidation)]
+    internal static partial void ClientCacheNoServerInvalidation(this ILogger logger, TimeSpan timeToLive);
+
+    [LoggerMessage(LogLevel.Information, "The client-side cache is invalidated by keyspace notifications: delivery is at-most-once and flushes are not observed, so residual staleness is bounded by the cache TimeToLive ({TimeToLive}).", EventName = "ClientCacheKeyspaceNotifications", EventId = IdClientCacheKeyspaceNotifications)]
+    internal static partial void ClientCacheKeyspaceNotifications(this ILogger logger, TimeSpan timeToLive);
+
+    [LoggerMessage(LogLevel.Warning, "The cache key prefix '{KeyPrefix}' is not covered by the client-side cache's configured prefixes; under {Mode} such keys are never stored locally, so this cache operates distributed-only. Add the prefix to CacheOptions.Prefixes.", EventName = "ClientCacheKeyPrefixNotCovered", EventId = IdClientCacheKeyPrefixNotCovered)]
+    internal static partial void ClientCacheKeyPrefixNotCovered(this ILogger logger, string keyPrefix, StackExchange.Redis.Caching.CacheTrackingMode mode);
+
+    [LoggerMessage(LogLevel.Debug, "Client-side cache validated: tracking mode {Mode}.", EventName = "ClientCacheValidated", EventId = IdClientCacheValidated)]
+    internal static partial void ClientCacheValidated(this ILogger logger, StackExchange.Redis.Caching.CacheTrackingMode mode);
 }
