@@ -20,9 +20,25 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 10.0.x
+      # Surfaced early so the version to release is visible even if something later fails.
+      # Cutting a release means creating a GitHub Release tagged with whatever this prints;
+      # release.yml then verifies the tag agrees with nbgv.
+      - name: Report computed version
+        run: |
+          dotnet tool install --global nbgv
+          version=$(nbgv get-version --project src/StackExchange.Redis.HybridCache --variable NuGetPackageVersion)
+          echo "### Computed package version: \`$version\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Computed package version: $version"
       - name: Build
         run: dotnet build -c Release
       - name: Test
         run: dotnet test -c Release --no-build
         env:
           REDIS_HOST: localhost:6379
+      # The real pack runs in release.yml, but a packaging regression is silent there until a
+      # release is cut - so pack and grade the package (SourceLink, deterministic, embedded
+      # symbols, readme/icon/license metadata) on every PR and push too.
+      - name: Pack and validate package
+        run: |
+          dotnet pack src/StackExchange.Redis.HybridCache/StackExchange.Redis.HybridCache.csproj --no-build -c Release /p:PackageOutputPath="$GITHUB_WORKSPACE/.nupkgs"
+          dotnet run eng/packcheck.cs .nupkgs/StackExchange.Redis.HybridCache.*.nupkg
