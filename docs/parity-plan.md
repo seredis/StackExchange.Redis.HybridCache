@@ -68,7 +68,14 @@ Divergences to assert in tests (deliberate, documented)
   near copy I will accept") rather than store-time ("how long L1 keeps it") — same base
   instant (the local store), same bound, but the copy is refetched on demand rather than
   evicted on a timer.
-- L1-specific events (`LocalCacheHit`/`Miss`/`Write`) are not emitted (see #10).
+- ~~L1-specific events (`LocalCacheHit`/`Miss`/`Write`) are not emitted (see #10).~~ **Narrowed
+  (2026-11-11, issue #3)**: `LocalCacheHit`/`LocalCacheMiss` are now emitted from the context
+  API's completion shape — a read that completes synchronously was answered by the local cache,
+  so a value served from one is a local hit (with no distributed events, matching stock's
+  L1-hit path); everything else is a local miss, with the distributed Get/Hit/Miss/Failed
+  events emitted only when a real round trip happens. Still not emitted: `LocalCacheWrite`
+  (admission into the client cache happens below us and is not individually observable; the
+  client cache's own counters via `GetClientCache()` cover it).
 
 Test inheritance (from `Microsoft.Extensions.Caching.Hybrid.Tests`)
 ---

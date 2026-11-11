@@ -233,11 +233,14 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
         bool canBeCanceled,
         CancellationToken cancellationToken)
     {
+        // Event mapping (stock semantics, adapted): a read that completes synchronously was
+        // answered by the local cache - that is this implementation's L1, so a value served
+        // from it is LocalCacheHit, with no distributed events (stock's L1 hit never consults
+        // L2). Anything else is LocalCacheMiss; the distributed Get/Hit/Miss/Failed events are
+        // then emitted only when a real round trip happens. A synchronously-served nil (or a
+        // rejected/invalidated envelope) is a local miss with no distributed fetch: the local
+        // answer IS the fleet answer, and the factory events that follow tell the rest.
         bool eventSourceEnabled = HybridCacheEventSource.Log.IsEnabled();
-        if (eventSourceEnabled)
-        {
-            HybridCacheEventSource.Log.DistributedCacheGet();
-        }
 
         ValueTask<BufferChunk> pendingRead;
         try
@@ -248,6 +251,8 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
         {
             if (eventSourceEnabled)
             {
+                HybridCacheEventSource.Log.LocalCacheMiss();
+                HybridCacheEventSource.Log.DistributedCacheGet();
                 HybridCacheEventSource.Log.DistributedCacheFailed();
             }
 
@@ -259,6 +264,12 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
         if (!pendingRead.IsCompleted)
         {
             // a real round trip
+            if (eventSourceEnabled)
+            {
+                HybridCacheEventSource.Log.LocalCacheMiss();
+                HybridCacheEventSource.Log.DistributedCacheGet();
+            }
+
             return AwaitBackendReadAsync(keyString ?? key.ToString(), pendingRead, state, factory, options, tags, flags, canBeCanceled, eventSourceEnabled, cancellationToken);
         }
 
@@ -266,27 +277,18 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
         try
         {
             blob = pendingRead.GetAwaiter().GetResult();
-            if (eventSourceEnabled)
-            {
-                if (blob.HasValue)
-                {
-                    HybridCacheEventSource.Log.DistributedCacheHit();
-                }
-                else
-                {
-                    HybridCacheEventSource.Log.DistributedCacheMiss();
-                }
-            }
         }
         catch (Exception ex)
         {
             if (eventSourceEnabled)
             {
+                HybridCacheEventSource.Log.LocalCacheMiss();
+                HybridCacheEventSource.Log.DistributedCacheGet();
                 HybridCacheEventSource.Log.DistributedCacheFailed();
             }
 
             _logger.CacheUnderlyingDataQueryFailure(ex);
-            blob = default;
+            return JoinOrCreateStampede(keyString ?? key.ToString(), state, factory, options, tags, flags, canBeCanceled, readPerformed: true, cancellationToken);
         }
 
         if (blob.HasValue && TryGetPayload(blob.AsArraySegment(), key, out HybridCachePayload.Parsed parsed))
@@ -295,14 +297,24 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
             if (!tagsCurrent.IsCompletedSuccessfully)
             {
                 // a cold tag timestamp (first consult since connect); rare by construction
-                return AwaitTagsAsync(keyString ?? key.ToString(), tagsCurrent, blob, parsed.Payload, state, factory, options, tags, flags, canBeCanceled, cancellationToken);
+                return AwaitTagsAsync(keyString ?? key.ToString(), tagsCurrent, blob, parsed.Payload, state, factory, options, tags, flags, canBeCanceled, eventSourceEnabled, cancellationToken);
             }
 
             if (tagsCurrent.Result && TryDeserialize(parsed.Payload, out T value))
             {
+                if (eventSourceEnabled)
+                {
+                    HybridCacheEventSource.Log.LocalCacheHit();
+                }
+
                 blob.RecycleIfAppropriate();
                 return new(value);
             }
+        }
+
+        if (eventSourceEnabled)
+        {
+            HybridCacheEventSource.Log.LocalCacheMiss();
         }
 
         blob.RecycleIfAppropriate();
@@ -375,12 +387,25 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
         IEnumerable<string>? tags,
         HybridCacheEntryFlags flags,
         bool canBeCanceled,
+        bool eventSourceEnabled,
         CancellationToken cancellationToken)
     {
+        // the entry itself was answered by the local cache (only a tag timestamp went remote),
+        // so the local hit/miss verdict follows whether that answer is finally served
         if (await tagsCurrent.ConfigureAwait(false) && TryDeserialize(payload, out T value))
         {
+            if (eventSourceEnabled)
+            {
+                HybridCacheEventSource.Log.LocalCacheHit();
+            }
+
             blob.RecycleIfAppropriate();
             return value;
+        }
+
+        if (eventSourceEnabled)
+        {
+            HybridCacheEventSource.Log.LocalCacheMiss();
         }
 
         blob.RecycleIfAppropriate();

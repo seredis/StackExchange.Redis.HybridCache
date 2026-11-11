@@ -2,9 +2,11 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 // Adapted from dotnet/extensions (Microsoft.Extensions.Caching.Hybrid, Internal/HybridCacheEventSource.cs);
 // the event IDs and counter names are kept identical so existing dashboards carry over, under the
-// renamed source "StackExchange-Redis-HybridCache". Note: the local-cache events are not emitted by
-// this implementation (a locally-served read is indistinguishable below IDatabase); the client
-// cache has its own counters via GetClientCache().
+// renamed source "StackExchange-Redis-HybridCache". The local-cache hit/miss events are emitted
+// from the context API's completion shape (a synchronously completed read was answered by the
+// local cache - this implementation's L1); LocalCacheWrite is NOT emitted (admission into the
+// client cache happens below us and is not individually observable); the client cache also has
+// its own counters via GetClientCache().
 
 using System.Diagnostics;
 using System.Diagnostics.Tracing;
