@@ -12,8 +12,10 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- the REAL shipped stock stack; note this brings a transitive StackExchange.Redis 2.x,
-         which is why this is a separate project from the RedisHybrid (v4) one -->
+    <!-- the REAL shipped stock stack, resolved as a normal consumer would get it (a transitive
+         StackExchange.Redis 2.x: the dependency is a >= 2.7.27 floor, and nothing here raises
+         it). Kept as a separate project from RedisHybrid so this flavor demonstrably runs the
+         stock stack as shipped, not force-unified onto the v4 alpha -->
     <PackageReference Include="Microsoft.Extensions.Caching.Hybrid" />
     <PackageReference Include="Microsoft.Extensions.Caching.StackExchangeRedis" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" />

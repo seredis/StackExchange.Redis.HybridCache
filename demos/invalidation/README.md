@@ -80,5 +80,8 @@ The same `LocalCacheExpiration` is configured in both setups: in the stock setup
 > This demo lives in the SE.Hybrid repo while `StackExchange.Redis.HybridCache` has no
 > published package (`RedisHybrid` uses a project reference); it is destined for the
 > [demos](https://github.com/seredis/demos) repo once the package exists. The two flavors are
-> separate projects out of necessity as well as neatness: the stock L2 provider pins
-> StackExchange.Redis 2.x, which cannot share a process with the v4 client.
+> separate projects so that the stock one runs the shipped stack exactly as it resolves for a
+> normal consumer (`Microsoft.Extensions.Caching.StackExchangeRedis` floors StackExchange.Redis
+> at 2.7.27, so it runs on 2.x here) rather than force-unified onto the v4 alpha. That is a
+> fidelity choice, not a constraint: the dependency is a floor, not a pin, and the stock stack
+> has been verified working with the graph unified to v4.
