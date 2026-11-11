@@ -1,6 +1,6 @@
 // Scenario.cs - the scripted demonstration (demo machinery, not example code; the files worth
 // reading are Setup.cs and Usage.cs). Two "web servers" share one redis and one database.
-// Three escalating scenarios, identical for both implementations:
+// Four escalating scenarios, identical for both modes:
 //
 //   1. server A updates a product through the cache (SetAsync);
 //   2. the database changes behind the cache and server A evicts the key (RemoveAsync),
@@ -21,7 +21,10 @@ static class Scenario
     private static readonly TimeSpan WatchLimit = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(40);
 
-    public static async Task RunAsync(string flavor, string description, CatalogService a, CatalogService b, Database database)
+    /// <summary>Runs the four scenarios; returns one summary row per scenario (the caller prints
+    /// the summary, side by side when several modes ran).</summary>
+    public static async Task<List<(string What, string A, string B)>> RunAsync(
+        string flavor, string description, CatalogService a, CatalogService b, Database database)
     {
         Console.WriteLine($"== {flavor} ==");
         Console.WriteLine(description);
@@ -74,16 +77,7 @@ static class Scenario
         var r4 = await WatchAsync([null, b], final.Version);
         summary.Add(("4. tag invalidation, invalidator quiet", "(quiet)", Format(r4[1])));
 
-        Console.WriteLine();
-        Console.WriteLine("== time until each server served the new value ==");
-        Console.WriteLine($"   {"",-40}{a.Name,14}{b.Name,14}");
-        foreach (var (what, resultA, resultB) in summary)
-        {
-            Console.WriteLine($"   {what,-40}{resultA,14}{resultB,14}");
-        }
-
-        Console.WriteLine();
-        Console.WriteLine($"   database queries: {a.Name} {a.DatabaseQueries}, {b.Name} {b.DatabaseQueries}");
+        return summary;
     }
 
     /// <summary>Polls each non-null service until it serves <paramref name="expectedVersion"/> (or the

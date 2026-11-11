@@ -3,19 +3,19 @@
 Two `HybridCache` implementations, one demo: the in-box
 [`HybridCache`](https://learn.microsoft.com/aspnet/core/performance/caching/hybrid) over
 `IDistributedCache`-on-redis, and `StackExchange.Redis.HybridCache` built on
-[client-side caching](https://seredis.dev/ClientSideCaching). Both run the **same application
-code** — two "web servers", each with its own near cache, sharing one redis and one database —
-and the same scripted scenario. The only file that differs between the two projects is
-`Setup.cs`:
+[client-side caching](https://seredis.dev/ClientSideCaching). One console app runs the **same
+application code** — two "web servers", each with its own near cache, sharing one redis and one
+database — against either implementation, or both back to back with a side-by-side comparison.
+The only file where the two modes differ is `Setup.cs`:
 
 | | |
 |---|---|
-| `StockHybrid/Setup.cs` | `AddHybridCache` + `AddStackExchangeRedisCache`: a `MemoryCache` near cache per server, **no invalidation channel** — a foreign change is seen when the local copy *expires* (passive) |
-| `RedisHybrid/Setup.cs` | `AddRedisHybridCache`: the multiplexer's client cache is the near cache, and redis **pushes invalidations** into it (`CLIENT TRACKING`, RESP3) — a foreign change evicts the local copy immediately (active) |
-| `Shared/Usage.cs` | the application's cache consumption — identical, verbatim, for both |
-| `Shared/Program.cs`, `Scenario.cs`, `Database.cs` | demo machinery, also shared verbatim |
+| `Setup.cs`, stock mode | `AddHybridCache` + `AddStackExchangeRedisCache`: a `MemoryCache` near cache per server, **no invalidation channel** — a foreign change is seen when the local copy *expires* (passive) |
+| `Setup.cs`, push mode | `AddRedisHybridCache`: the multiplexer's client cache is the near cache, and redis **pushes invalidations** into it (`CLIENT TRACKING`, RESP3) — a foreign change evicts the local copy immediately (active) |
+| `Usage.cs` | the application's cache consumption — identical for both |
+| `Program.cs`, `Scenario.cs`, `Database.cs` | demo machinery, also identical for both |
 
-Both setups use the same entry options (`Expiration` 5 min, `LocalCacheExpiration` 10 s); what
+Both modes use the same entry options (`Expiration` 5 min, `LocalCacheExpiration` 10 s); what
 changes is the invalidation transport, not the policy.
 
 ## Run
@@ -24,8 +24,9 @@ Requires Docker (compose plugin) and the .NET 10 SDK.
 
 ```bash
 docker compose up -d --wait     # one redis 8.2 on host port 16412
-dotnet run --project StockHybrid
-dotnet run --project RedisHybrid
+dotnet run                      # both modes, compared
+dotnet run -- stock             # just the in-box HybridCache (passive)
+dotnet run -- push              # just StackExchange.Redis.HybridCache (active)
 ```
 
 ## What you see
@@ -44,12 +45,13 @@ already changed:
 Measured output (one run, this machine):
 
 ```
-                                           stock (passive)      SE.Redis (active)
-                                          server A  server B    server A  server B
-1. update (SetAsync)                        0.00 s    9.02 s      0.00 s    0.00 s
-2. remove (RemoveAsync)                     0.02 s   10.01 s      0.02 s    0.02 s
-3. tag invalidation                         0.02 s   10.01 s      0.02 s    0.02 s
-4. tag invalidation, invalidator quiet     (quiet)    > 15 s     (quiet)    0.02 s
+== time until each server served the new value ==
+                                                   stock (passive)       SE.Redis (active)
+                                               server A   server B     server A   server B
+   1. update (SetAsync)                          0.00 s     9.03 s       0.00 s     0.00 s
+   2. remove (RemoveAsync)                       0.02 s    10.00 s       0.02 s     0.02 s
+   3. tag invalidation                           0.02 s    10.01 s       0.02 s     0.02 s
+   4. tag invalidation, invalidator quiet       (quiet)     > 15 s      (quiet)     0.02 s
 ```
 
 ## Why
@@ -73,15 +75,14 @@ Measured output (one run, this machine):
   `SetAsync` evicts B's entry copy, a foreign `RemoveByTagAsync` evicts B's tag copy. B's next
   read notices within its poll interval (~20 ms of it is the round trip to refetch).
 
-The same `LocalCacheExpiration` is configured in both setups: in the stock setup it is the
-*mechanism*; in the SE.Redis setup it is a safety net behind the push channel (see the
+The same `LocalCacheExpiration` is configured in both modes: in the stock mode it is the
+*mechanism*; in the SE.Redis mode it is a safety net behind the push channel (see the
 [usage docs](../../docs/usage.md) for the degraded modes where it matters).
 
 > This demo lives in the SE.Hybrid repo while `StackExchange.Redis.HybridCache` has no
-> published package (`RedisHybrid` uses a project reference); it is destined for the
-> [demos](https://github.com/seredis/demos) repo once the package exists. The two flavors are
-> separate projects so that the stock one runs the shipped stack exactly as it resolves for a
-> normal consumer (`Microsoft.Extensions.Caching.StackExchangeRedis` floors StackExchange.Redis
-> at 2.7.27, so it runs on 2.x here) rather than force-unified onto the v4 alpha. That is a
-> fidelity choice, not a constraint: the dependency is a floor, not a pin, and the stock stack
-> has been verified working with the graph unified to v4.
+> published package (it uses a project reference); it is destined for the
+> [demos](https://github.com/seredis/demos) repo once the package exists. Both modes run in
+> one process, which means the stock mode runs with StackExchange.Redis unified onto the v4
+> alpha (its `Microsoft.Extensions.Caching.StackExchangeRedis` dependency is a `>= 2.7.27`
+> floor, not a pin) — a combination that has been verified working, both here and in a
+> dedicated probe of the stock stack on v4.

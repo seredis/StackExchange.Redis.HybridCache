@@ -1,7 +1,7 @@
-// Usage.cs - how the application consumes the cache. This file is shared VERBATIM by both
-// demo projects: everything here is the standard HybridCache abstraction, so the code cannot
-// tell which implementation it is running on. The implementations are swapped in Setup.cs,
-// and nowhere else.
+// Usage.cs - how the application consumes the cache. This file is identical for both modes:
+// everything here is the standard HybridCache abstraction, so the code cannot tell which
+// implementation it is running on. The implementations are swapped in Setup.cs, and
+// nowhere else.
 
 using Microsoft.Extensions.Caching.Hybrid;
 
