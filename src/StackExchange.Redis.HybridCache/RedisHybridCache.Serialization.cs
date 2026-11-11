@@ -17,7 +17,9 @@ public sealed partial class RedisHybridCache
     internal int MaximumPayloadBytes { get; }
 
     internal IHybridCacheSerializer<T> GetSerializer<T>()
-        => (IHybridCacheSerializer<T>)_serializers.GetOrAdd(typeof(T), _ => ResolveSerializer<T>()); // netstandard2.0: no TArg overload
+        => _serializers.TryGetValue(typeof(T), out object? existing)
+            ? (IHybridCacheSerializer<T>)existing // the hot path: no delegate, no allocation
+            : (IHybridCacheSerializer<T>)_serializers.GetOrAdd(typeof(T), _ => ResolveSerializer<T>()); // netstandard2.0: no TArg overload
 
     internal bool TrySerialize<T>(T value, out BufferChunk buffer, out IHybridCacheSerializer<T>? serializer)
     {

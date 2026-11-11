@@ -344,6 +344,25 @@ Phasing
 > `TrackingByPrefix`). Not yet: stampede combining, tag-timestamp memoization outside the CSC,
 > flags beyond the basics, metrics/logging polish, cluster/groups.
 >
+> **Status (2026-11-11, zero-alloc read path)**: the backend moved from `IDatabase` to the v4
+> context API (`RespDatabaseContext` + custom `IRespHandler` implementations): a locally-served
+> read completes synchronously - no `Task`, no state machine - the envelope is parsed in place
+> over one pooled rent, tag names are never materialized (the tag run is walked as UTF-8 and
+> tag-timestamp keys are built from borrowed spans), and the key prefix lives on the context so
+> keys are composed during the frame render. On net10.0 the `ReadOnlySpan<char>`
+> `GetOrCreateAsync` virtual is overridden, which is what the abstractions'
+> `DefaultInterpolatedStringHandler` overloads route through: `GetOrCreateAsync($"foos/{id}",
+> ...)` never materializes the key as a string on a hit (it is settled only on a miss, or when a
+> read leaves the synchronous path). Asserted by tests: **a hit allocates nothing beyond the
+> returned value** - zero bytes over 1000 hits for string, tagged and interpolated keys alike.
+> Notes: the key-echo check compares UTF-8 against the char span without allocating;
+> `MemoryExtensions.IndexOfAnyInRange<char>` measured 96 B/call on the .NET 11 rc2 runtime
+> (BCL issue - we use a plain loop); the fault-injection tests now disable commands via
+> `CommandMap` (an `IDatabase`-level proxy never sees context-API traffic). Follow-up spotted
+> during this work: `RespDatabaseContext.WithMaxCacheAge` is read-time and public, so
+> `LocalCacheExpiration` is now honourable (memoize a context per distinct value) - the
+> documented divergence below can be retired when that lands.
+>
 > **Status (2026-11-10, post-parity)**: feature parity with the stock `DefaultHybridCache` is
 > implemented per [parity-plan.md](parity-plan.md) — stampede combining (full port, incl.
 > shared-cancellation and immutable/mutable value semantics), all six flags, validation parity,

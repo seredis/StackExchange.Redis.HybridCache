@@ -32,8 +32,11 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- shared across TFMs: the surface is TFM-invariant today; grow per-TFM folders
-         (SE.Redis style) only when that stops being true -->
+    <!-- the base files are shared across TFMs; progressively additive APIs in later frameworks
+         get a folder each (SE.Redis style) -->
     <AdditionalFiles Include="PublicAPI/PublicAPI.*.txt" />
+    <!-- the ReadOnlySpan<char> GetOrCreateAsync override: the abstractions expose the span
+         virtuals on their net10.0 target only -->
+    <AdditionalFiles Include="PublicAPI/net10.0/PublicAPI.*.txt" Condition="$([MSBuild]::IsTargetFrameworkCompatible('$(TargetFramework)', 'net10.0'))" />
   </ItemGroup>
 </Project>

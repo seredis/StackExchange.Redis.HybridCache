@@ -3,10 +3,10 @@
 // Behavioural parity with the in-box implementation: the Remove* shapes are ported from
 // dotnet/extensions (Microsoft.Extensions.Caching.Hybrid.Tests/FunctionalTests.cs); the fault
 // handling, validation and quota tests assert the same logged-event contract (same event IDs)
-// as the stock UnreliableL2/L2 suites, rebuilt over a fault-injecting multiplexer.
+// as the stock UnreliableL2/L2 suites, rebuilt over connections whose CommandMap disables the
+// command in question.
 
 using System;
-using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Caching.Hybrid;
@@ -128,14 +128,23 @@ public class ParityTests : IClassFixture<RedisFixture>
     }
 
     // fault handling: same logged-event contract as stock (CacheBackendReadFailure = 6,
-    // CacheBackendWriteFailure = 7), with the caller always served
+    // CacheBackendWriteFailure = 7), with the caller always served. Failure is injected with a
+    // real connection whose CommandMap disables the command in question (the backend goes through
+    // the v4 context API, so an IDatabase-level fault proxy never sees the traffic).
+
+    private ConnectionMultiplexer ConnectWithoutCommand(string command)
+    {
+        ConfigurationOptions config = ConfigurationOptions.Parse($"{_fx.Host},connectTimeout=2000,abortConnect=true");
+        config.CommandMap = CommandMap.Create([command], available: false);
+        return ConnectionMultiplexer.Connect(config);
+    }
 
     [Fact]
     public async Task BackendReadFailure_IsLoggedMiss_AndValueServed()
     {
         Assert.SkipWhen(_fx.Connection is null, _fx.SkipReason);
         var logs = new LogCollector();
-        var muxer = FaultInjectingMultiplexer.Create(_fx.Connection!, failReads: true, failWrites: false);
+        using var muxer = ConnectWithoutCommand("GET");
         await using var provider = CreateProvider(RedisFixture.NewPrefix(), logs, muxer);
         var cache = provider.GetRequiredService<HybridCacheBase>();
 
@@ -148,7 +157,7 @@ public class ParityTests : IClassFixture<RedisFixture>
     {
         Assert.SkipWhen(_fx.Connection is null, _fx.SkipReason);
         var logs = new LogCollector();
-        var muxer = FaultInjectingMultiplexer.Create(_fx.Connection!, failReads: false, failWrites: true);
+        using var muxer = ConnectWithoutCommand("SET");
         string prefix = RedisFixture.NewPrefix();
         await using var provider = CreateProvider(prefix, logs, muxer);
         var cache = provider.GetRequiredService<HybridCacheBase>();
@@ -273,71 +282,3 @@ public class ParityTests : IClassFixture<RedisFixture>
     }
 }
 
-/// <summary>
-/// Wraps a real multiplexer, failing string reads and/or writes on the databases it hands out -
-/// the equivalent of the stock suite's unreliable-L2 harness.
-/// </summary>
-public class FaultInjectingMultiplexer : DispatchProxy
-{
-    private IConnectionMultiplexer? _target;
-    private bool _failReads;
-    private bool _failWrites;
-
-    public static IConnectionMultiplexer Create(IConnectionMultiplexer target, bool failReads, bool failWrites)
-    {
-        object proxy = Create<IConnectionMultiplexer, FaultInjectingMultiplexer>()!;
-        var typed = (FaultInjectingMultiplexer)proxy;
-        typed._target = target;
-        typed._failReads = failReads;
-        typed._failWrites = failWrites;
-        return (IConnectionMultiplexer)proxy;
-    }
-
-    protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
-    {
-        object? result = targetMethod!.Invoke(_target, args);
-        if (targetMethod.Name == nameof(IConnectionMultiplexer.GetDatabase) && result is IDatabase db)
-        {
-            return FaultInjectingDatabase.Create(db, _failReads, _failWrites);
-        }
-
-        return result;
-    }
-
-    private class FaultInjectingDatabase : DispatchProxy
-    {
-        private IDatabase? _target;
-        private bool _failReads;
-        private bool _failWrites;
-
-        public static IDatabase Create(IDatabase target, bool failReads, bool failWrites)
-        {
-            object proxy = Create<IDatabase, FaultInjectingDatabase>()!;
-            var typed = (FaultInjectingDatabase)proxy;
-            typed._target = target;
-            typed._failReads = failReads;
-            typed._failWrites = failWrites;
-            return (IDatabase)proxy;
-        }
-
-        protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
-        {
-            switch (targetMethod!.Name)
-            {
-                case nameof(IDatabase.StringGetAsync) when _failReads:
-                    return Task.FromException<RedisValue>(new InvalidOperationException("deliberate read failure"));
-                case nameof(IDatabase.StringSetAsync) when _failWrites:
-                    return Task.FromException<bool>(new InvalidOperationException("deliberate write failure"));
-                default:
-                    try
-                    {
-                        return targetMethod.Invoke(_target, args);
-                    }
-                    catch (TargetInvocationException tie) when (tie.InnerException is not null)
-                    {
-                        throw tie.InnerException;
-                    }
-            }
-        }
-    }
-}

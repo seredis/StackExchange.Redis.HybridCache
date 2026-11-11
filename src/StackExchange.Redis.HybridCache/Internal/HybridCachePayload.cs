@@ -1,4 +1,4 @@
-// Licensed to the .NET Foundation under one or more agreements.
+﻿// Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 // Adapted from dotnet/extensions (Microsoft.Extensions.Caching.Hybrid, Internal/HybridCachePayload.cs);
 // the wire format is kept byte-compatible. Tag/wildcard expiration checks are performed by the
@@ -47,12 +47,13 @@ internal static class HybridCachePayload
 
     internal readonly struct Parsed
     {
-        public Parsed(ArraySegment<byte> payload, TimeSpan remainingTime, long creationTime, string[] tags)
+        public Parsed(ArraySegment<byte> payload, TimeSpan remainingTime, long creationTime, ArraySegment<byte> tagsRegion, int tagCount)
         {
             Payload = payload;
             RemainingTime = remainingTime;
             CreationTime = creationTime;
-            Tags = tags;
+            TagsRegion = tagsRegion;
+            TagCount = tagCount;
         }
 
         public ArraySegment<byte> Payload { get; }
@@ -61,7 +62,54 @@ internal static class HybridCachePayload
 
         public long CreationTime { get; }
 
-        public string[] Tags { get; }
+        /// <summary>
+        /// The raw length-prefixed UTF-8 tag run, as validated slices of the source buffer: tag
+        /// names are never materialized as strings on the read path (the tag check only needs the
+        /// bytes, to build the tag-timestamp keys). Walk with <see cref="TagEnumerator"/>.
+        /// </summary>
+        public ArraySegment<byte> TagsRegion { get; }
+
+        public int TagCount { get; }
+
+        public TagEnumerator GetTagEnumerator() => new(TagsRegion);
+    }
+
+    /// <summary>Walks the length-prefixed UTF-8 tags of a <see cref="Parsed"/> envelope, in place.</summary>
+    internal struct TagEnumerator
+    {
+        // indices rather than spans, so a caller can hold this across awaits
+        private readonly ArraySegment<byte> _region;
+        private int _offset;
+
+        public TagEnumerator(ArraySegment<byte> region)
+        {
+            _region = region;
+            _offset = 0;
+        }
+
+        /// <summary>Gets the next tag's UTF-8 bytes; the region was validated during parse, so this cannot fail mid-walk.</summary>
+        public bool TryGetNext(out ArraySegment<byte> tag)
+        {
+            if (_offset >= _region.Count)
+            {
+                tag = default;
+                return false;
+            }
+
+            ReadOnlySpan<byte> remaining = _region.AsSpan(_offset);
+            int before = remaining.Length;
+            if (!TryRead7BitEncodedInt64(ref remaining, out ulong u64))
+            {
+                tag = default; // unreachable post-validation; fail safe regardless
+                return false;
+            }
+
+            int length = (int)u64;
+            int start = _region.Offset + _offset + (before - remaining.Length);
+            tag = new ArraySegment<byte>(_region.Array!, start, length);
+            _offset = (start - _region.Offset) + length;
+            return true;
+        }
     }
 
     public static int GetMaxBytes(string key, in TagSet tags, int payloadSize)
@@ -142,10 +190,15 @@ internal static class HybridCachePayload
 
     /// <summary>
     /// Parses an envelope, validating framing, key echo and entry expiry. Tag and wildcard
-    /// expiration are NOT checked here; the caller checks <see cref="Parsed.Tags"/> and
+    /// expiration are NOT checked here; the caller checks <see cref="Parsed.TagsRegion"/> and
     /// <see cref="Parsed.CreationTime"/> against the tag-timestamp keys.
     /// </summary>
-    public static ParseResult TryParse(ArraySegment<byte> source, string key, long nowTicks, out Parsed parsed, out Exception? fault)
+    /// <remarks>
+    /// The key is a char span rather than a string so the zero-allocation read path (interpolated
+    /// keys via the <c>ReadOnlySpan&lt;char&gt;</c> <c>GetOrCreateAsync</c> overloads) can perform
+    /// the echo check without materializing it; nothing here allocates on success.
+    /// </remarks>
+    public static ParseResult TryParse(ArraySegment<byte> source, ReadOnlySpan<char> key, long nowTicks, out Parsed parsed, out Exception? fault)
     {
         fault = null;
         parsed = default;
@@ -211,29 +264,30 @@ internal static class HybridCachePayload
 
             int tagCount = (int)u64;
 
-            // key echo: compare as bytes (bitwise), protecting against case-insensitive/colliding backends
+            // key echo: compare as bytes (bitwise), protecting against case-misconfigured prefixes
+            // or any other way two logical keys could land on one backend key
             if (!TryReadLengthPrefixed(ref bytes, out ReadOnlySpan<byte> keyBytes))
             {
                 return ParseResult.InvalidData;
             }
 
-            byte[] expectedKey = Encoding.GetBytes(key);
-            if (!keyBytes.SequenceEqual(expectedKey))
+            if (!Utf8Equals(keyBytes, key))
             {
                 return ParseResult.InvalidKey;
             }
 
-            string[] tags = tagCount == 0 ? [] : new string[tagCount];
+            // validate the tag run's framing now (so later walks cannot fail), but keep the tags as
+            // raw bytes: the read path only ever needs them to build tag-timestamp keys
+            int tagsStart = source.Count - bytes.Length;
             for (int i = 0; i < tagCount; i++)
             {
-                if (!TryReadLengthPrefixed(ref bytes, out ReadOnlySpan<byte> tagBytes))
+                if (!TryReadLengthPrefixed(ref bytes, out _))
                 {
                     return ParseResult.InvalidData;
                 }
-
-                byte[] tagArray = tagBytes.ToArray();
-                tags[i] = Encoding.GetString(tagArray, 0, tagArray.Length);
             }
+
+            int tagsLength = (source.Count - bytes.Length) - tagsStart;
 
             if (bytes.Length != payloadLength + 2
                 || BinaryPrimitives.ReadUInt16LittleEndian(bytes.Slice(payloadLength)) != sentinel)
@@ -246,7 +300,8 @@ internal static class HybridCachePayload
                 new ArraySegment<byte>(source.Array!, start, payloadLength),
                 new TimeSpan(remainingTicks),
                 creationTime,
-                tags);
+                new ArraySegment<byte>(source.Array!, source.Offset + tagsStart, tagsLength),
+                tagCount);
             return ParseResult.Success;
         }
         catch (Exception ex)
@@ -254,60 +309,117 @@ internal static class HybridCachePayload
             fault = ex;
             return ParseResult.ParseFault;
         }
+    }
 
-        static bool TryReadLengthPrefixed(ref ReadOnlySpan<byte> buffer, out ReadOnlySpan<byte> value)
+    /// <summary>Compares UTF-8 bytes against UTF-16 text without allocating.</summary>
+    private static bool Utf8Equals(ReadOnlySpan<byte> utf8, ReadOnlySpan<char> text)
+    {
+        if (utf8.Length > text.Length * 3)
         {
-            int length;
-            if (!TryRead7BitEncodedInt64(ref buffer, out ulong u64Length)
-                || u64Length > int.MaxValue
-                || buffer.Length < (length = (int)u64Length))
-            {
-                value = default;
-                return false;
-            }
-
-            value = buffer.Slice(0, length);
-            buffer = buffer.Slice(length);
-            return true;
+            return false; // cheap length bound: a char never encodes to more than 3 bytes
         }
 
-        static bool TryRead7BitEncodedInt64(ref ReadOnlySpan<byte> buffer, out ulong result)
+        const int StackLimit = 256;
+        byte[]? rented = null;
+        int maxBytes = Encoding.GetMaxByteCount(text.Length);
+        Span<byte> scratch = maxBytes <= StackLimit
+            ? stackalloc byte[StackLimit]
+            : (rented = ArrayPool<byte>.Shared.Rent(maxBytes));
+        try
         {
-            const int MaxBytesWithoutOverflow = 9;
-            result = 0;
-            int index = 0;
-            byte byteReadJustNow;
-            for (int shift = 0; shift < MaxBytesWithoutOverflow * 7; shift += 7)
+            int written = EncodeUtf8(text, scratch);
+            return utf8.SequenceEqual(scratch.Slice(0, written));
+        }
+        finally
+        {
+            if (rented is not null)
             {
-                if (index >= buffer.Length)
-                {
-                    return false; // truncated
-                }
-
-                byteReadJustNow = buffer[index++];
-                result |= (byteReadJustNow & 0x7Ful) << shift;
-
-                if (byteReadJustNow <= 0x7Fu)
-                {
-                    buffer = buffer.Slice(index);
-                    return true;
-                }
+                ArrayPool<byte>.Shared.Return(rented);
             }
+        }
+    }
 
+    /// <summary>Encodes UTF-16 text as UTF-8 into <paramref name="target"/>, returning the byte count.</summary>
+    internal static int EncodeUtf8(ReadOnlySpan<char> text, Span<byte> target)
+    {
+#if NET8_0_OR_GREATER
+        return Encoding.GetBytes(text, target);
+#else
+        if (text.IsEmpty)
+        {
+            return 0;
+        }
+
+        // downlevel: no span encoding API; bounce through pooled arrays
+        char[] chars = ArrayPool<char>.Shared.Rent(text.Length);
+        byte[] bytes = ArrayPool<byte>.Shared.Rent(target.Length);
+        try
+        {
+            text.CopyTo(chars);
+            int written = Encoding.GetBytes(chars, 0, text.Length, bytes, 0);
+            bytes.AsSpan(0, written).CopyTo(target);
+            return written;
+        }
+        finally
+        {
+            ArrayPool<char>.Shared.Return(chars);
+            ArrayPool<byte>.Shared.Return(bytes);
+        }
+#endif
+    }
+
+    private static bool TryReadLengthPrefixed(ref ReadOnlySpan<byte> buffer, out ReadOnlySpan<byte> value)
+    {
+        int length;
+        if (!TryRead7BitEncodedInt64(ref buffer, out ulong u64Length)
+            || u64Length > int.MaxValue
+            || buffer.Length < (length = (int)u64Length))
+        {
+            value = default;
+            return false;
+        }
+
+        value = buffer.Slice(0, length);
+        buffer = buffer.Slice(length);
+        return true;
+    }
+
+    private static bool TryRead7BitEncodedInt64(ref ReadOnlySpan<byte> buffer, out ulong result)
+    {
+        const int MaxBytesWithoutOverflow = 9;
+        result = 0;
+        int index = 0;
+        byte byteReadJustNow;
+        for (int shift = 0; shift < MaxBytesWithoutOverflow * 7; shift += 7)
+        {
             if (index >= buffer.Length)
             {
-                return false;
+                return false; // truncated
             }
 
             byteReadJustNow = buffer[index++];
-            if (byteReadJustNow > 0b_1u)
-            {
-                return false;
-            }
+            result |= (byteReadJustNow & 0x7Ful) << shift;
 
-            result |= (ulong)byteReadJustNow << (MaxBytesWithoutOverflow * 7);
-            buffer = buffer.Slice(index);
-            return true;
+            if (byteReadJustNow <= 0x7Fu)
+            {
+                buffer = buffer.Slice(index);
+                return true;
+            }
         }
+
+        if (index >= buffer.Length)
+        {
+            return false;
+        }
+
+        byteReadJustNow = buffer[index++];
+        if (byteReadJustNow > 0b_1u)
+        {
+            return false;
+        }
+
+        result |= (ulong)byteReadJustNow << (MaxBytesWithoutOverflow * 7);
+        buffer = buffer.Slice(index);
+        return true;
     }
 }

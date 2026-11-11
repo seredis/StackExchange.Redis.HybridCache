@@ -222,13 +222,17 @@ public sealed partial class RedisHybridCache
                     }
 
                     if (result.HasValue
-                        && Cache.TryGetPayload(result.AsArraySegment(), Key.Key, out HybridCachePayload.Parsed parsed)
-                        && await Cache.AreTagsCurrentAsync(parsed.CreationTime, parsed.Tags).ConfigureAwait(false))
+                        && Cache.TryGetPayload(result.AsArraySegment(), Key.Key.AsSpan(), out HybridCachePayload.Parsed parsed)
+                        && await Cache.AreTagsCurrentAsync(parsed.CreationTime, parsed).ConfigureAwait(false))
                     {
-                        // move into the payload segment (minus any framing/header/etc data)
-                        SetResultFromBytes(new BufferChunk(parsed.Payload.Array!, parsed.Payload.Offset, parsed.Payload.Count, returnToPool: false));
+                        // move into the payload segment (minus any framing/header/etc data); the
+                        // backend read is a pooled rent, so ownership (and the recycle duty)
+                        // transfers with it
+                        SetResultFromBytes(new BufferChunk(parsed.Payload.Array!, parsed.Payload.Offset, parsed.Payload.Count, returnToPool: result.ReturnToPool));
                         return;
                     }
+
+                    result.RecycleIfAppropriate();
                 }
 
                 // nothing from the backend; invoke the underlying data store

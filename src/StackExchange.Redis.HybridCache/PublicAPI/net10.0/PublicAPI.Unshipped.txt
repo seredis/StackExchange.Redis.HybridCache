@@ -1,0 +1,2 @@
+#nullable enable
+override StackExchange.Redis.HybridCache.RedisHybridCache.GetOrCreateAsync<TState, T>(System.ReadOnlySpan<char> key, TState state, System.Func<TState, System.Threading.CancellationToken, System.Threading.Tasks.ValueTask<T>>! factory, Microsoft.Extensions.Caching.Hybrid.HybridCacheEntryOptions? options = null, System.Collections.Generic.IEnumerable<string!>? tags = null, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask<T>

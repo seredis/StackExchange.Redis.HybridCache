@@ -2,29 +2,71 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 // The redis-backend equivalents of the stock implementation's L2 + tag-invalidation partials
 // (dotnet/extensions, Internal/DefaultHybridCache.L2.cs and DefaultHybridCache.TagInvalidation.cs),
-// rebuilt over IDatabase: entries are plain strings with PX expiry; tag-invalidation timestamps
-// are plain-string keys under the same tracked prefix, so with client-side caching enabled both
-// are locally cached and push-coherent - the stock local tag memo (and its refresh machinery)
-// has no equivalent here because the client cache *is* that memo, fleet-coherent.
+// rebuilt over the StackExchange.Redis v4 context API (RespDatabaseContext + custom IRespHandler
+// implementations), not IDatabase: a locally-served read completes synchronously with no Task, no
+// state machine and no payload copy beyond one pooled rent, which is what makes the hit path
+// allocation-free. Entries are plain strings with PX expiry; tag-invalidation timestamps are
+// plain-string keys under the same tracked prefix, so with client-side caching enabled both are
+// locally cached and push-coherent - the stock local tag memo (and its refresh machinery) has no
+// equivalent here because the client cache *is* that memo, fleet-coherent.
+//
+// The key prefix lives on the context (AppendKeyPrefix), so keys are composed during the frame
+// render rather than by string concatenation; keys travel as RespKey (a borrowed span), which is
+// what lets the ReadOnlySpan<char> GetOrCreateAsync overloads reach the backend without ever
+// materializing the interpolated key on a hit.
 
 using System;
 using System.Buffers;
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Caching.Hybrid;
+using RESPite.Messages;
 using StackExchange.Redis.HybridCache.Internal;
+using StackExchange.Redis.Protocol;
 
 namespace StackExchange.Redis.HybridCache;
 
 public sealed partial class RedisHybridCache
 {
+    private static readonly RespCommand _get = "GET".Command();
+    private static readonly RespCommand _set = "SET".Command();
+    private static readonly RespCommand _unlink = "UNLINK".Command();
+
+    // "__SER_HCT__*": the wildcard tag-timestamp key, consulted on every read
+    private static readonly byte[] _wildcardTagKeyUtf8 = CreateTagKeyUtf8(WildcardTag);
+
+    // resolved on first backend use, NOT in the constructor: constructing the cache must make no
+    // call on the multiplexer (DI can register a placeholder that is configured later; the
+    // stampede-only paths never need a backend at all)
+    private RespContext? _rawContext;
+
+    private static ReadOnlySpan<byte> TagKeyInfixUtf8 => "__SER_HCT__"u8;
+
     internal long CurrentTimestamp() => _clock.GetUtcNow().UtcTicks;
 
-    private IDatabase Database => _multiplexer.GetDatabase();
+    private RespDatabaseContext Context => new(_rawContext ??= CreateRawContext());
 
-    private RedisKey EntryKey(string key) => _options.KeyPrefix + key;
+    private RespContext CreateRawContext()
+    {
+        // a benign race: concurrent first uses each build an identical context, one wins
+        RespDatabaseContext context = _multiplexer.GetDatabaseContext();
+        string prefix = _options.KeyPrefix;
+        if (!string.IsNullOrEmpty(prefix))
+        {
+            context = context.AppendKeyPrefix(prefix);
+        }
 
-    private RedisKey TagKey(string tag) => _options.KeyPrefix + TagKeyInfix + tag;
+        return (RespContext)context;
+    }
+
+    private static byte[] CreateTagKeyUtf8(string tag)
+    {
+        byte[] result = new byte[TagKeyInfixUtf8.Length + HybridCachePayload.Encoding.GetByteCount(tag)];
+        TagKeyInfixUtf8.CopyTo(result);
+        HybridCachePayload.EncodeUtf8(tag.AsSpan(), result.AsSpan(TagKeyInfixUtf8.Length));
+        return result;
+    }
 
     // CacheOptIn: being a HybridCache entry *is* the admission decision - force first-miss
     // admission (and reach) under every tracking mode, not just TrackingByPrefix. The local
@@ -33,32 +75,39 @@ public sealed partial class RedisHybridCache
     private static CommandFlags ReadCommandFlags(HybridCacheEntryFlags flags)
         => (flags & HybridCacheEntryFlags.DisableLocalCache) == 0 ? CommandFlags.CacheOptIn : CommandFlags.CacheOptOut;
 
-    internal async Task<BufferChunk> GetFromBackendAsync(string key, HybridCacheEntryFlags flags)
-    {
-        byte[]? blob = (byte[]?)await Database.StringGetAsync(EntryKey(key), ReadCommandFlags(flags)).ConfigureAwait(false);
-        return blob is null ? default : new BufferChunk(blob);
-    }
+    internal ValueTask<BufferChunk> GetFromBackendAsync(string key, HybridCacheEntryFlags flags)
+        => Context.SendAsync($"{_get}{new RespKey(key)}", ReadCommandFlags(flags), PooledBlobHandler.Instance);
 
-    internal async Task SetBackendAsync(string key, CacheItem item, BufferChunk payload, HybridCacheEntryOptions? options)
+    internal ValueTask<BufferChunk> GetFromBackendAsync(ReadOnlySpan<char> key, HybridCacheEntryFlags flags)
+        => Context.SendAsync($"{_get}{new RespKey(key)}", ReadCommandFlags(flags), PooledBlobHandler.Instance);
+
+    internal async ValueTask SetBackendAsync(string key, CacheItem item, BufferChunk payload, HybridCacheEntryOptions? options)
     {
         TimeSpan expiration = GetBackendExpiration(options);
         int maxLen = HybridCachePayload.GetMaxBytes(key, item.Tags, payload.Length);
         byte[] oversized = ArrayPool<byte>.Shared.Rent(maxLen);
+        ValueTask<bool> pending;
         try
         {
             int len = HybridCachePayload.Write(oversized, key, item.CreationTimestamp, expiration, item.Tags, payload.AsSequence());
-            _ = await Database.StringSetAsync(EntryKey(key), new ReadOnlyMemory<byte>(oversized, 0, len), expiration).ConfigureAwait(false);
+
+            // the frame is rendered (and the value copied) synchronously inside the call, so the
+            // rented buffer can go back before the await
+            pending = Context.SendAsync<bool>(
+                $"{_set}{new RespKey(key)}{oversized.AsSpan(0, len)}{(Expiration)expiration}");
         }
         finally
         {
             ArrayPool<byte>.Shared.Return(oversized);
         }
+
+        _ = await pending.ConfigureAwait(false);
     }
 
-    internal TimeSpan GetBackendExpiration(HybridCacheEntryOptions? options)
-        => options?.Expiration ?? _defaultExpiration;
+    internal ValueTask<long> DeleteBackendAsync(string key)
+        => Context.SendAsync<long>($"{_unlink}{new RespKey(key)}");
 
-    private bool TryGetPayload(ArraySegment<byte> blob, string key, out HybridCachePayload.Parsed parsed)
+    private bool TryGetPayload(ArraySegment<byte> blob, ReadOnlySpan<char> key, out HybridCachePayload.Parsed parsed)
     {
         HybridCachePayload.ParseResult result = HybridCachePayload.TryParse(
             blob, key, CurrentTimestamp(), out parsed, out Exception? fault);
@@ -76,85 +125,232 @@ public sealed partial class RedisHybridCache
     }
 
     /// <summary>Checks a post-factory entry against the wildcard + its tags (the "invalidation raced the factory" probe).</summary>
-    internal ValueTask<bool> IsCurrentAsync(CacheItem item)
+    internal async ValueTask<bool> IsCurrentAsync(CacheItem item)
     {
         TagSet tags = item.Tags;
         long creationTime = item.CreationTimestamp;
-        return tags.Count switch
+        int count = tags.Count;
+        for (int i = 0; i < count; i++)
         {
-            0 => AreTagsCurrentAsync(creationTime, [], wildcardPrefetch: null),
-            1 => AreTagsCurrentAsync(creationTime, [tags.GetSinglePrechecked()], wildcardPrefetch: null),
-            _ => AreTagsCurrentAsync(creationTime, tags.ToArray(), wildcardPrefetch: null),
-        };
+            if (await GetTagInvalidationTicksAsync(tags[i]).ConfigureAwait(false) >= creationTime)
+            {
+                return false;
+            }
+        }
+
+        return await GetWildcardInvalidationTicksAsync().ConfigureAwait(false) < creationTime;
     }
 
     /// <summary>
     /// Checks whether an entry created at <paramref name="creationTime"/> survives the wildcard
-    /// and all of <paramref name="tags"/>; tag reads are issued concurrently (they pipeline on
-    /// the multiplexer, and with client-side caching they are typically local anyway).
+    /// and all of <paramref name="parsed"/>'s tags (raw UTF-8, from the envelope - tag
+    /// names are never materialized). Tag timestamps are hot by construction (the wildcard is
+    /// consulted on every read), so with client-side caching these reads are typically local and
+    /// synchronous, and this method then completes synchronously without allocating.
     /// </summary>
-    internal async ValueTask<bool> AreTagsCurrentAsync(long creationTime, string[] tags, Task<long>? wildcardPrefetch = null)
+    internal ValueTask<bool> AreTagsCurrentAsync(long creationTime, in HybridCachePayload.Parsed parsed)
     {
-        Task<long> wildcard = wildcardPrefetch ?? GetTagInvalidationTicksAsync(TagSet.WildcardTag);
-
-        switch (tags.Length)
+        // hand-rolled rather than an async method, so the common all-local case runs purely
+        // synchronously: tag timestamps are hot by construction, and only a cold timestamp
+        // (first consult since connect) drops to the awaiting slow path
+        HybridCachePayload.TagEnumerator tags = parsed.GetTagEnumerator();
+        while (tags.TryGetNext(out ArraySegment<byte> tag))
         {
-            case 0:
-                break;
-            case 1:
-                if (await GetTagInvalidationTicksAsync(tags[0]).ConfigureAwait(false) >= creationTime)
-                {
-                    return false;
-                }
+            ValueTask<long> pending = GetTagInvalidationTicksAsync(tag);
+            if (!pending.IsCompletedSuccessfully)
+            {
+                return AwaitTagWalkAsync(pending, tags, creationTime);
+            }
 
-                break;
-            default:
-                Task<long>[] pending = new Task<long>[tags.Length];
-                for (int i = 0; i < tags.Length; i++)
-                {
-                    pending[i] = GetTagInvalidationTicksAsync(tags[i]);
-                }
-
-                foreach (Task<long> task in pending)
-                {
-                    if (await task.ConfigureAwait(false) >= creationTime)
-                    {
-                        return false;
-                    }
-                }
-
-                break;
+            if (pending.Result >= creationTime)
+            {
+                return new(false);
+            }
         }
 
-        return await wildcard.ConfigureAwait(false) < creationTime;
+        ValueTask<long> wildcard = GetWildcardInvalidationTicksAsync();
+        return wildcard.IsCompletedSuccessfully
+            ? new(wildcard.Result < creationTime)
+            : AwaitWildcardAsync(wildcard, creationTime);
     }
 
-    internal async Task<long> GetTagInvalidationTicksAsync(string tag)
+    private async ValueTask<bool> AwaitTagWalkAsync(ValueTask<long> pending, HybridCachePayload.TagEnumerator tags, long creationTime)
+    {
+        if (await pending.ConfigureAwait(false) >= creationTime)
+        {
+            return false;
+        }
+
+        while (tags.TryGetNext(out ArraySegment<byte> tag))
+        {
+            if (await GetTagInvalidationTicksAsync(tag).ConfigureAwait(false) >= creationTime)
+            {
+                return false;
+            }
+        }
+
+        return await GetWildcardInvalidationTicksAsync().ConfigureAwait(false) < creationTime;
+    }
+
+    private async ValueTask<bool> AwaitWildcardAsync(ValueTask<long> wildcard, long creationTime)
+        => await wildcard.ConfigureAwait(false) < creationTime;
+
+    internal ValueTask<long> GetWildcardInvalidationTicksAsync()
     {
         try
         {
-            // tag timestamps are hot by construction (consulted on every read of a tagged entry,
-            // the wildcard on every read); CacheOptIn makes them locally cached + push-coherent
-            // under every tracking mode
-            byte[]? value = (byte[]?)await Database.StringGetAsync(TagKey(tag), CommandFlags.CacheOptIn).ConfigureAwait(false);
-            return value is { Length: sizeof(long) } ? BinaryPrimitives.ReadInt64LittleEndian(value) : 0;
+            return FailClosedAsync(GetTagTicksCoreAsync(_wildcardTagKeyUtf8));
         }
         catch (Exception ex)
         {
-            // fail closed, matching stock: an unreadable tag invalidates everything it covers,
-            // which costs a refill but never serves a value past its invalidation
-            _logger.TagInvalidationReadFailure(ex);
-            return long.MaxValue;
+            // fail closed even when the send itself throws synchronously (an unusable
+            // multiplexer, say) - matching the per-tag reads
+            return FailClosed(ex);
         }
     }
 
-    private Task InvalidateTagAsync(string tag, long timestamp)
+    /// <summary>Reads a tag's invalidation timestamp by its UTF-8 name (no string materialized).</summary>
+    internal ValueTask<long> GetTagInvalidationTicksAsync(ArraySegment<byte> tagUtf8)
     {
-        byte[] ticks = new byte[sizeof(long)];
-        BinaryPrimitives.WriteInt64LittleEndian(ticks, timestamp);
+        try
+        {
+            int length = TagKeyInfixUtf8.Length + tagUtf8.Count;
+            byte[] rented = ArrayPool<byte>.Shared.Rent(length);
+            TagKeyInfixUtf8.CopyTo(rented);
+            tagUtf8.AsSpan().CopyTo(rented.AsSpan(TagKeyInfixUtf8.Length));
+
+            // the frame render copies the key before SendAsync returns, so the rent can go
+            // straight back - even when the read itself is still pending
+            ValueTask<long> pending = GetTagTicksCoreAsync(rented.AsSpan(0, length));
+            ArrayPool<byte>.Shared.Return(rented);
+            return FailClosedAsync(pending);
+        }
+        catch (Exception ex)
+        {
+            return FailClosed(ex);
+        }
+    }
+
+    /// <summary>Reads a tag's invalidation timestamp by name (the post-factory probe, where tags are strings).</summary>
+    internal ValueTask<long> GetTagInvalidationTicksAsync(string tag)
+    {
+        try
+        {
+            int maxLength = TagKeyInfixUtf8.Length + HybridCachePayload.Encoding.GetMaxByteCount(tag.Length);
+            byte[] rented = ArrayPool<byte>.Shared.Rent(maxLength);
+            TagKeyInfixUtf8.CopyTo(rented);
+            int length = TagKeyInfixUtf8.Length + HybridCachePayload.EncodeUtf8(tag.AsSpan(), rented.AsSpan(TagKeyInfixUtf8.Length));
+
+            ValueTask<long> pending = GetTagTicksCoreAsync(rented.AsSpan(0, length));
+            ArrayPool<byte>.Shared.Return(rented);
+            return FailClosedAsync(pending);
+        }
+        catch (Exception ex)
+        {
+            return FailClosed(ex);
+        }
+    }
+
+    // tag timestamps are consulted on every read of a tagged entry (the wildcard on every read);
+    // CacheOptIn makes them locally cached + push-coherent under every tracking mode
+    private ValueTask<long> GetTagTicksCoreAsync(ReadOnlySpan<byte> tagKeyUtf8)
+        => Context.SendAsync($"{_get}{new RespKey(tagKeyUtf8)}", CommandFlags.CacheOptIn, TagTicksHandler.Instance);
+
+    private ValueTask<long> FailClosedAsync(ValueTask<long> pending)
+    {
+        if (pending.IsCompletedSuccessfully)
+        {
+            return pending; // common: a locally-served read; no wrapper needed
+        }
+
+        return Awaited(this, pending);
+
+        static async ValueTask<long> Awaited(RedisHybridCache @this, ValueTask<long> pending)
+        {
+            try
+            {
+                return await pending.ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                return @this.FailClosedCore(ex);
+            }
+        }
+    }
+
+    private ValueTask<long> FailClosed(Exception ex) => new(FailClosedCore(ex));
+
+    private long FailClosedCore(Exception ex)
+    {
+        // fail closed, matching stock: an unreadable tag invalidates everything it covers,
+        // which costs a refill but never serves a value past its invalidation
+        _logger.TagInvalidationReadFailure(ex);
+        return long.MaxValue;
+    }
+
+    private ValueTask<bool> InvalidateTagAsync(string tag, long timestamp)
+    {
+        int maxLength = TagKeyInfixUtf8.Length + HybridCachePayload.Encoding.GetMaxByteCount(tag.Length);
+        byte[] rented = ArrayPool<byte>.Shared.Rent(maxLength + sizeof(long));
+        TagKeyInfixUtf8.CopyTo(rented);
+        int length = TagKeyInfixUtf8.Length + HybridCachePayload.EncodeUtf8(tag.AsSpan(), rented.AsSpan(TagKeyInfixUtf8.Length));
 
         // entries created before this instant are now invalid; every client's cached copy of the
         // tag key is push-invalidated, so the whole fleet converges within the push latency
-        return Database.StringSetAsync(TagKey(tag), ticks, _tagKeyLifetime);
+        BinaryPrimitives.WriteInt64LittleEndian(rented.AsSpan(maxLength, sizeof(long)), timestamp);
+        ValueTask<bool> pending = Context.SendAsync<bool>(
+            $"{_set}{new RespKey(rented.AsSpan(0, length))}{rented.AsSpan(maxLength, sizeof(long))}{(Expiration)_tagKeyLifetime}");
+        ArrayPool<byte>.Shared.Return(rented);
+        return pending;
     }
+
+    /// <summary>Copies the raw reply into a pooled buffer; a nil reply is a miss (<c>default</c>).</summary>
+    private sealed class PooledBlobHandler : IRespHandler<BufferChunk>
+    {
+        public static readonly PooledBlobHandler Instance = new();
+
+        private PooledBlobHandler()
+        {
+        }
+
+        public BufferChunk Parse(ref RespReader reader)
+        {
+            if (reader.IsNull)
+            {
+                return default;
+            }
+
+            int length = reader.ScalarLength();
+            byte[] oversized = ArrayPool<byte>.Shared.Rent(Math.Max(length, 1));
+            int copied = reader.CopyTo(oversized);
+            Debug.Assert(copied == length, "scalar length disagreed with itself");
+            return new BufferChunk(oversized, 0, length, returnToPool: true);
+        }
+    }
+
+    /// <summary>Reads a tag-timestamp value in place: 8 little-endian ticks, anything else (including nil) is zero.</summary>
+    private sealed class TagTicksHandler : IRespHandler<long>
+    {
+        public static readonly TagTicksHandler Instance = new();
+
+        private TagTicksHandler()
+        {
+        }
+
+        public long Parse(ref RespReader reader)
+        {
+            if (reader.IsNull || !reader.ScalarLengthIs(sizeof(long)))
+            {
+                return 0;
+            }
+
+            Span<byte> buffer = stackalloc byte[sizeof(long)];
+            int copied = reader.CopyTo(buffer);
+            Debug.Assert(copied == sizeof(long), "scalar length disagreed with itself");
+            return BinaryPrimitives.ReadInt64LittleEndian(buffer);
+        }
+    }
+
+    internal TimeSpan GetBackendExpiration(HybridCacheEntryOptions? options)
+        => options?.Expiration ?? _defaultExpiration;
 }

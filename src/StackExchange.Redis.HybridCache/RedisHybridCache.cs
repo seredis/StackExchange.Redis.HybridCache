@@ -118,8 +118,56 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
             return JoinOrCreateStampede(key, state, factory, options, tags, flags, canBeCanceled, readPerformed: false, cancellationToken);
         }
 
-        return GetOrCreateCoreAsync(key, state, factory, options, tags, flags, canBeCanceled, cancellationToken);
+        return GetOrCreateCoreAsync(key, key.AsSpan(), state, factory, options, tags, flags, canBeCanceled, cancellationToken);
     }
+
+#if NET10_0_OR_GREATER
+    /// <inheritdoc />
+    /// <remarks>
+    /// The allocation-free spelling: the abstract base routes its interpolated-key
+    /// (<see cref="System.Runtime.CompilerServices.DefaultInterpolatedStringHandler"/>) overloads
+    /// here via the handler's text span. The key travels to the backend as a borrowed span
+    /// (<c>RespKey</c>), so a locally-served hit never materializes it as a <see cref="string"/>;
+    /// the key is only settled when the call has to go further - a miss (the stampede and the
+    /// stored envelope need the real key) or a read that leaves the synchronous path (a span
+    /// cannot bridge an await).
+    /// </remarks>
+    public override ValueTask<T> GetOrCreateAsync<TState, T>(
+        ReadOnlySpan<char> key,
+        TState state,
+        Func<TState, CancellationToken, ValueTask<T>> factory,
+        HybridCacheEntryOptions? options = null,
+        IEnumerable<string>? tags = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (factory is null)
+        {
+            throw new ArgumentNullException(nameof(factory));
+        }
+
+        bool canBeCanceled = cancellationToken.CanBeCanceled;
+        if (canBeCanceled)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+
+        HybridCacheEntryFlags flags = GetEffectiveFlags(options);
+        if (!ValidateKey(key))
+        {
+            // the cache mechanisms are bypassed entirely (matching stock behaviour)
+            return (flags & HybridCacheEntryFlags.DisableUnderlyingData) == 0
+                ? factory(state, cancellationToken) : default;
+        }
+
+        if ((flags & HybridCacheEntryFlags.DisableDistributedCacheRead) != 0)
+        {
+            // no backend read: the stampede needs the key as its identity anyway
+            return JoinOrCreateStampede(key.ToString(), state, factory, options, tags, flags, canBeCanceled, readPerformed: false, cancellationToken);
+        }
+
+        return GetOrCreateCoreAsync(null, key, state, factory, options, tags, flags, canBeCanceled, cancellationToken);
+    }
+#endif
 
     private ValueTask<T> JoinOrCreateStampede<TState, T>(
         string key,
@@ -162,8 +210,19 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
         return stampede.UnwrapReservedAsync(_logger);
     }
 
-    private async ValueTask<T> GetOrCreateCoreAsync<TState, T>(
-        string key,
+    // Fast path: a direct read, outside any stampede - with client-side caching enabled this is
+    // the equivalent of the stock implementation's L1 hit. A locally-served read completes
+    // synchronously through the v4 context API (no Task, no state machine), the envelope is
+    // parsed in place over one pooled rent, and the tag checks are themselves locally-served
+    // reads - so a hit allocates nothing beyond the deserialized value. (The in-stampede read
+    // only runs for the rare contested-creation path; see the stampede partials.)
+    //
+    // keyString is null when the caller only has a span (an interpolated key): the string is
+    // settled on demand - at a miss (the stampede and the stored envelope need the real key), or
+    // when a read leaves the synchronous path (a span cannot bridge an await).
+    private ValueTask<T> GetOrCreateCoreAsync<TState, T>(
+        string? keyString,
+        ReadOnlySpan<char> key,
         TState state,
         Func<TState, CancellationToken, ValueTask<T>> factory,
         HybridCacheEntryOptions? options,
@@ -173,24 +232,99 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
         CancellationToken cancellationToken)
     {
         bool eventSourceEnabled = HybridCacheEventSource.Log.IsEnabled();
+        if (eventSourceEnabled)
+        {
+            HybridCacheEventSource.Log.DistributedCacheGet();
+        }
 
-        // Fast path: a direct read, outside any stampede - with client-side caching enabled this
-        // is the equivalent of the stock implementation's L1 hit, costing no stampede allocation.
-        // (The in-stampede read only runs for the rare contested-creation path; see the stampede
-        // partials.)
-
-        // overlap the wildcard-invalidation read (needed to validate any payload) with the entry read
-        Task<long> wildcard = GetTagInvalidationTicksAsync(WildcardTag);
-
-        BufferChunk blob = default;
+        ValueTask<BufferChunk> pendingRead;
         try
+        {
+            pendingRead = GetFromBackendAsync(key, flags);
+        }
+        catch (Exception ex)
         {
             if (eventSourceEnabled)
             {
-                HybridCacheEventSource.Log.DistributedCacheGet();
+                HybridCacheEventSource.Log.DistributedCacheFailed();
             }
 
-            blob = await GetFromBackendAsync(key, flags).ConfigureAwait(false);
+            // includes WRONGTYPE from a foreign (e.g. stock hash) entry: a logged miss, never an error
+            _logger.CacheUnderlyingDataQueryFailure(ex);
+            return JoinOrCreateStampede(keyString ?? key.ToString(), state, factory, options, tags, flags, canBeCanceled, readPerformed: true, cancellationToken);
+        }
+
+        if (!pendingRead.IsCompleted)
+        {
+            // a real round trip
+            return AwaitBackendReadAsync(keyString ?? key.ToString(), pendingRead, state, factory, options, tags, flags, canBeCanceled, eventSourceEnabled, cancellationToken);
+        }
+
+        BufferChunk blob;
+        try
+        {
+            blob = pendingRead.GetAwaiter().GetResult();
+            if (eventSourceEnabled)
+            {
+                if (blob.HasValue)
+                {
+                    HybridCacheEventSource.Log.DistributedCacheHit();
+                }
+                else
+                {
+                    HybridCacheEventSource.Log.DistributedCacheMiss();
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            if (eventSourceEnabled)
+            {
+                HybridCacheEventSource.Log.DistributedCacheFailed();
+            }
+
+            _logger.CacheUnderlyingDataQueryFailure(ex);
+            blob = default;
+        }
+
+        if (blob.HasValue && TryGetPayload(blob.AsArraySegment(), key, out HybridCachePayload.Parsed parsed))
+        {
+            ValueTask<bool> tagsCurrent = AreTagsCurrentAsync(parsed.CreationTime, parsed);
+            if (!tagsCurrent.IsCompletedSuccessfully)
+            {
+                // a cold tag timestamp (first consult since connect); rare by construction
+                return AwaitTagsAsync(keyString ?? key.ToString(), tagsCurrent, blob, parsed.Payload, state, factory, options, tags, flags, canBeCanceled, cancellationToken);
+            }
+
+            if (tagsCurrent.Result && TryDeserialize(parsed.Payload, out T value))
+            {
+                blob.RecycleIfAppropriate();
+                return new(value);
+            }
+        }
+
+        blob.RecycleIfAppropriate();
+
+        // miss: join or create the shared operation for this (key, flags)
+        return JoinOrCreateStampede(keyString ?? key.ToString(), state, factory, options, tags, flags, canBeCanceled, readPerformed: true, cancellationToken);
+    }
+
+    private async ValueTask<T> AwaitBackendReadAsync<TState, T>(
+        string key,
+        ValueTask<BufferChunk> pendingRead,
+        TState state,
+        Func<TState, CancellationToken, ValueTask<T>> factory,
+        HybridCacheEntryOptions? options,
+        IEnumerable<string>? tags,
+        HybridCacheEntryFlags flags,
+        bool canBeCanceled,
+        bool eventSourceEnabled,
+        CancellationToken cancellationToken)
+    {
+        BufferChunk blob = default;
+        try
+        {
+            blob = await pendingRead.ConfigureAwait(false);
             if (eventSourceEnabled)
             {
                 if (blob.HasValue)
@@ -214,15 +348,40 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
             _logger.CacheUnderlyingDataQueryFailure(ex);
         }
 
-        if (blob.HasValue
-            && TryGetPayload(blob.AsArraySegment(), key, out HybridCachePayload.Parsed parsed)
-            && await AreTagsCurrentAsync(parsed.CreationTime, parsed.Tags, wildcard).ConfigureAwait(false)
-            && TryDeserialize(parsed.Payload, out T value))
+        if (blob.HasValue && TryGetPayload(blob.AsArraySegment(), key.AsSpan(), out HybridCachePayload.Parsed parsed))
         {
+            if (await AreTagsCurrentAsync(parsed.CreationTime, parsed).ConfigureAwait(false)
+                && TryDeserialize(parsed.Payload, out T value))
+            {
+                blob.RecycleIfAppropriate();
+                return value;
+            }
+        }
+
+        blob.RecycleIfAppropriate();
+        return await JoinOrCreateStampede(key, state, factory, options, tags, flags, canBeCanceled, readPerformed: true, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async ValueTask<T> AwaitTagsAsync<TState, T>(
+        string key,
+        ValueTask<bool> tagsCurrent,
+        BufferChunk blob,
+        ArraySegment<byte> payload,
+        TState state,
+        Func<TState, CancellationToken, ValueTask<T>> factory,
+        HybridCacheEntryOptions? options,
+        IEnumerable<string>? tags,
+        HybridCacheEntryFlags flags,
+        bool canBeCanceled,
+        CancellationToken cancellationToken)
+    {
+        if (await tagsCurrent.ConfigureAwait(false) && TryDeserialize(payload, out T value))
+        {
+            blob.RecycleIfAppropriate();
             return value;
         }
 
-        // miss: join or create the shared operation for this (key, flags)
+        blob.RecycleIfAppropriate();
         return await JoinOrCreateStampede(key, state, factory, options, tags, flags, canBeCanceled, readPerformed: true, cancellationToken).ConfigureAwait(false);
     }
 
@@ -254,7 +413,7 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
         {
             // the server pushes invalidation to every tracking client; a local write through this
             // multiplexer also invalidates the local client cache before it is sent (read-your-writes)
-            await Database.KeyDeleteAsync(EntryKey(key)).ConfigureAwait(false);
+            _ = await DeleteBackendAsync(key).ConfigureAwait(false);
         }
     }
 
@@ -273,7 +432,7 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
         {
             if (ValidateKey(key))
             {
-                (pending ??= []).Add(Database.KeyDeleteAsync(EntryKey(key)));
+                (pending ??= []).Add(DeleteBackendAsync(key).AsTask());
             }
         }
 
@@ -284,11 +443,11 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
     }
 
     /// <inheritdoc />
-    public override ValueTask RemoveByTagAsync(string tag, CancellationToken cancellationToken = default)
+    public override async ValueTask RemoveByTagAsync(string tag, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(tag))
         {
-            return default; // nothing sensible to do (matches stock)
+            return; // nothing sensible to do (matches stock)
         }
 
         if (HybridCacheEventSource.Log.IsEnabled())
@@ -296,7 +455,7 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
             HybridCacheEventSource.Log.TagInvalidated();
         }
 
-        return new(InvalidateTagAsync(tag, CurrentTimestamp()));
+        _ = await InvalidateTagAsync(tag, CurrentTimestamp()).ConfigureAwait(false);
     }
 
     /// <inheritdoc />
@@ -319,7 +478,7 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
                     HybridCacheEventSource.Log.TagInvalidated();
                 }
 
-                (pending ??= []).Add(InvalidateTagAsync(tag, timestamp));
+                (pending ??= []).Add(InvalidateTagAsync(tag, timestamp).AsTask());
             }
         }
 
@@ -332,14 +491,14 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
     internal HybridCacheEntryFlags GetEffectiveFlags(HybridCacheEntryOptions? options)
         => (options?.Flags | _hardFlags) ?? _defaultFlags;
 
-    // reserve non-printable characters from keys, to prevent potential backend abuse
+    // reserve non-printable characters from keys, to prevent potential backend abuse.
+    // A plain loop on every TFM: MemoryExtensions.IndexOfAnyInRange<char> measured 96 B of
+    // allocation PER CALL here (net10 runtime; see the zero-alloc hit tests, which would
+    // catch any regression), and keys are short.
     private static bool ContainsReservedCharacters(ReadOnlySpan<char> key)
     {
         const char MaxControlChar = (char)31;
 
-#if NET8_0_OR_GREATER
-        return key.IndexOfAnyInRange((char)0, MaxControlChar) >= 0;
-#else
         foreach (char c in key)
         {
             if (c <= MaxControlChar)
@@ -349,15 +508,16 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
         }
 
         return false;
-#endif
     }
 
-    private bool ValidateKey(string key)
+    private bool ValidateKey(string? key)
+        => key is not null ? ValidateKey(key.AsSpan()) : FailEmptyKey();
+
+    private bool ValidateKey(ReadOnlySpan<char> key)
     {
-        if (string.IsNullOrWhiteSpace(key))
+        if (key.IsEmpty || key.IsWhiteSpace())
         {
-            _logger.KeyEmptyOrWhitespace();
-            return false;
+            return FailEmptyKey();
         }
 
         if (key.Length > _maximumKeyLength)
@@ -366,7 +526,7 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
             return false;
         }
 
-        if (ContainsReservedCharacters(key.AsSpan()))
+        if (ContainsReservedCharacters(key))
         {
             _logger.KeyInvalidContent();
             return false;
@@ -374,5 +534,11 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
 
         // nothing to complain about
         return true;
+    }
+
+    private bool FailEmptyKey()
+    {
+        _logger.KeyEmptyOrWhitespace();
+        return false;
     }
 }
