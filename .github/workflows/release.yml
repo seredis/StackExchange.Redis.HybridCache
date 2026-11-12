@@ -10,7 +10,8 @@
 # height - the tag name does not set it. Read the version to tag off the CI run's step summary
 # ("Report computed version" in CI.yml) and create the release with that tag; the guard step
 # below fails the run on any mismatch rather than publishing a package that disagrees with its
-# release.
+# release. Tags are bare versions (e.g. 0.1.25-alpha, no v prefix), matching SE.Redis; the
+# guard tolerates a leading v but the convention is bare.
 #
 # Deliberately does not run tests: the commit being released already passed CI, and this job's
 # only job is to reproduce that build byte-for-byte and push it. Also deliberately runs on Linux,
