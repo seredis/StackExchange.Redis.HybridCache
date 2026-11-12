@@ -6,9 +6,6 @@
     <Project Path="tests/StackExchange.Redis.HybridCache.Tests/StackExchange.Redis.HybridCache.Tests.csproj" />
     <Project Path="tests/StackExchange.Redis.HybridCache.MixedMode.Tests/StackExchange.Redis.HybridCache.MixedMode.Tests.csproj" />
   </Folder>
-  <Folder Name="/demos/">
-    <Project Path="demos/invalidation/InvalidationDemo.csproj" />
-  </Folder>
   <Folder Name="/docs/">
     <File Path="docs/design.md" />
     <File Path="README.md" />

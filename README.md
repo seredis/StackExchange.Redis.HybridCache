@@ -70,6 +70,10 @@ Layout
 - `tests/StackExchange.Redis.HybridCache.Tests/` — xunit.v3 on Microsoft.Testing.Platform
 - `docs/design.md` — design notes
 
+A runnable active-vs-passive invalidation demo (this implementation against the in-box
+`HybridCache`, console and interactive TUI) lives in the
+[demos repo](https://github.com/seredis/demos/tree/main/hybridcache).
+
 Building
 ---
 
