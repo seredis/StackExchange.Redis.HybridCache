@@ -1,4 +1,4 @@
-Feature-parity plan: SE.Hybrid vs the in-box `DefaultHybridCache`
+Feature-parity plan: StackExchange.Redis.HybridCache vs the in-box `DefaultHybridCache`
 ===
 
 Reference: `dotnet/extensions` `main`, `src/Libraries/Microsoft.Extensions.Caching.Hybrid`

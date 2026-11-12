@@ -1,4 +1,4 @@
-SE.Hybrid
+StackExchange.Redis.HybridCache
 ===
 
 A [`HybridCache`](https://learn.microsoft.com/aspnet/core/performance/caching/hybrid)
@@ -23,8 +23,8 @@ given the same serializer configuration.
 > shared cancellation and immutable/mutable value semantics), all entry flags, key/tag
 > validation, tag invalidation (push-coherent, server-assisted), logging and `EventSource`
 > telemetry with the stock event IDs, `TimeProvider` support — and the stock test suites have
-> been inherited and pass. See [docs/design.md](https://github.com/seredis/SE.Hybrid/blob/main/docs/design.md) for architecture and
-> remaining phases, and [docs/parity-plan.md](https://github.com/seredis/SE.Hybrid/blob/main/docs/parity-plan.md) for the parity inventory
+> been inherited and pass. See [docs/design.md](https://github.com/seredis/StackExchange.Redis.HybridCache/blob/main/docs/design.md) for architecture and
+> remaining phases, and [docs/parity-plan.md](https://github.com/seredis/StackExchange.Redis.HybridCache/blob/main/docs/parity-plan.md) for the parity inventory
 > and the deliberate divergences.
 
 Usage
@@ -59,7 +59,7 @@ Reads served from the client cache are local, synchronous and allocation-free; `
 and `RemoveByTagAsync` invalidate every server's near cache via redis push invalidation. A
 dedicated multiplexer for the cache is encouraged (client-side caching is connection-level) —
 register it keyed with `typeof(HybridCache)` and it is preferred automatically. See
-[docs/usage.md](https://github.com/seredis/SE.Hybrid/blob/main/docs/usage.md) for
+[docs/usage.md](https://github.com/seredis/StackExchange.Redis.HybridCache/blob/main/docs/usage.md) for
 configuration, degraded modes, serialization, and telemetry.
 
 Layout
@@ -86,4 +86,4 @@ License
 
 MIT. Portions are derived from
 [dotnet/extensions](https://github.com/dotnet/extensions) (`Microsoft.Extensions.Caching.Hybrid`),
-also MIT — see [THIRD-PARTY-NOTICES.md](https://github.com/seredis/SE.Hybrid/blob/main/THIRD-PARTY-NOTICES.md).
+also MIT — see [THIRD-PARTY-NOTICES.md](https://github.com/seredis/StackExchange.Redis.HybridCache/blob/main/THIRD-PARTY-NOTICES.md).

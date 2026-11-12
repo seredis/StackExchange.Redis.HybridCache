@@ -1,4 +1,4 @@
-SE.Hybrid — design notes
+StackExchange.Redis.HybridCache — design notes
 ===
 
 > Status: pre-implementation research, 2026-11-10. Everything here is a proposal; the open
@@ -439,7 +439,7 @@ Decisions so far
 Open questions
 ---
 
-> **Remaining work is tracked as GitHub issues** (seredis/SE.Hybrid #1–#13, 2026-11-11): contract
+> **Remaining work is tracked as GitHub issues** (seredis/StackExchange.Redis.HybridCache #1–#13, 2026-11-11): contract
 > loose ends (#1 first-use validation, #2 `LocalCacheExpiration`, #3 L1 events, #4
 > `ReportTagMetrics`), the v4-gated items (#5 flag split, #6 deserialized memo, #7 tag
 > memoization/eviction), hardening (#8 cluster, #9 netfx lane, #10 benchmarks, #11 reconnect

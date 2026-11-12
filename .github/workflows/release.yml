@@ -2,7 +2,7 @@
 #
 # Auth is NuGet Trusted Publishing (OIDC): no long-lived API key is stored anywhere.
 # The one-time setup on nuget.org is: username menu -> Trusted Publishing -> add policy with
-#   Repository Owner: seredis / Repository: SE.Hybrid / Workflow File: release.yml
+#   Repository Owner: seredis / Repository: StackExchange.Redis.HybridCache / Workflow File: release.yml
 #   Environment: release
 # plus a NUGET_USER repository secret holding the nuget.org profile name to publish as.
 #

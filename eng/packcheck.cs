@@ -101,7 +101,7 @@ foreach (var entry in assemblies)
     Check(sourceLink is not null, "SourceLink present");
     if (sourceLink is not null && commit is not null)
     {
-        Check(sourceLink.Contains("seredis/SE.Hybrid") && sourceLink.Contains(commit),
+        Check(sourceLink.Contains("seredis/StackExchange.Redis.HybridCache") && sourceLink.Contains(commit),
             "SourceLink targets this repository at the packed commit");
     }
 

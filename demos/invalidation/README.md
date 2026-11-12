@@ -79,7 +79,7 @@ The same `LocalCacheExpiration` is configured in both modes: in the stock mode i
 *mechanism*; in the SE.Redis mode it is a safety net behind the push channel (see the
 [usage docs](../../docs/usage.md) for the degraded modes where it matters).
 
-> This demo lives in the SE.Hybrid repo while `StackExchange.Redis.HybridCache` has no
+> This demo lives in the StackExchange.Redis.HybridCache repo while `StackExchange.Redis.HybridCache` has no
 > published package (it uses a project reference); it is destined for the
 > [demos](https://github.com/seredis/demos) repo once the package exists. Both modes run in
 > one process, which means the stock mode runs with StackExchange.Redis unified onto the v4

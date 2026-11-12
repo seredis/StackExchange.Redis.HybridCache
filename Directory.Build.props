@@ -14,8 +14,8 @@
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://seredis.dev/</PackageProjectUrl>
     <RepositoryType>git</RepositoryType>
-    <RepositoryUrl>https://github.com/seredis/SE.Hybrid/</RepositoryUrl>
-    <PackageReleaseNotes>https://github.com/seredis/SE.Hybrid/releases</PackageReleaseNotes>
+    <RepositoryUrl>https://github.com/seredis/StackExchange.Redis.HybridCache/</RepositoryUrl>
+    <PackageReleaseNotes>https://github.com/seredis/StackExchange.Redis.HybridCache/releases</PackageReleaseNotes>
     <DefaultLanguage>en-US</DefaultLanguage>
 
     <DebugSymbols>true</DebugSymbols>
