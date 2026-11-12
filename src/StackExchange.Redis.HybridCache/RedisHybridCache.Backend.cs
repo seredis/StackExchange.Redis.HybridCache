@@ -56,6 +56,85 @@ public sealed partial class RedisHybridCache
 
     private RespDatabaseContext Context => new(_rawContext ??= CreateRawContext());
 
+#if NET10_0_OR_GREATER
+    // The tag-read plumbing (issue #7): tag timestamps are read through a context whose policy
+    // carries a removal observer, and the observed serves feed a direct tag → ticks memo - so
+    // the per-read tag check on a hot entry is a span lookup, not a RESP key render + cache
+    // probe per tag. Resolved with the same benign race as the contexts above.
+    private RespContext? _rawTagContext;
+    private TagTicksMemo? _tagMemo;
+    private byte[]? _tagRemovalPrefixUtf8; // UTF8(KeyPrefix) + "__SER_HCT__": the notification pre-filter
+
+    private RespDatabaseContext TagReadContext => new(_rawTagContext ??= CreateRawTagContext());
+
+    private RespContext CreateRawTagContext()
+    {
+        RespDatabaseContext context = Context;
+        Caching.ClientCache? cache = _multiplexer.GetClientCache();
+        if (cache is null || !cache.Options.Enabled)
+        {
+            // no local cache: every tag read is remote anyway, and - more to the point - there
+            // is no invalidation source to keep a memo honest
+            return (RespContext)context;
+        }
+
+        string prefix = _options.KeyPrefix;
+        int prefixBytes = HybridCachePayload.Encoding.GetByteCount(prefix);
+        byte[] removalPrefix = new byte[prefixBytes + TagKeyInfixUtf8.Length];
+        HybridCachePayload.EncodeUtf8(prefix.AsSpan(), removalPrefix);
+        TagKeyInfixUtf8.CopyTo(removalPrefix.AsSpan(prefixBytes));
+        _tagRemovalPrefixUtf8 = removalPrefix;
+
+        Caching.CachePolicy basePolicy = cache.Options.DefaultPolicy;
+        _tagMemo = new TagTicksMemo(basePolicy.TimeToLive); // published before the context can serve a read
+
+        // ours first (a user handler that throws must not starve the memo; v4 swallows handler
+        // exceptions, but the order costs nothing), and the user's observer survives: a
+        // per-read policy REPLACES the default, so it must be carried over, combined
+        Caching.CacheKeyRemovedHandler handler = OnTagKeyRemoved;
+        if (basePolicy.RemovalHandler is { } existing)
+        {
+            handler = (Caching.CacheKeyRemovedHandler)Delegate.Combine(handler, existing);
+        }
+
+        return (RespContext)context.WithCachePolicy(basePolicy with { RemovalHandler = handler });
+    }
+
+    // test seam: whether the tag memo engaged (a client cache is present and enabled), after
+    // forcing the lazy tag-context resolution the first tag read would perform
+    internal bool TagMemoEngaged
+    {
+        get
+        {
+            _ = TagReadContext;
+            return _tagMemo is not null;
+        }
+    }
+
+    // The coherence half of the memo: a serve through TagReadContext arms this observer on the
+    // tag key, and the first removal at or after it (invalidation push, own write, eviction,
+    // expiry, flush - every reason is "drop" to us) lands here. Only tag keys are read through
+    // the enrolled context, so the prefix always matches in practice; anything unattributable
+    // clears the memo outright, which is always safe.
+    private void OnTagKeyRemoved(ReadOnlySpan<byte> key, Caching.CacheKeyRemovalReason reason)
+    {
+        if (_tagMemo is { } memo)
+        {
+            byte[]? prefix = _tagRemovalPrefixUtf8;
+            if (prefix is not null && key.StartsWith(prefix))
+            {
+                memo.Remove(key.Slice(prefix.Length));
+            }
+            else
+            {
+                memo.Clear();
+            }
+        }
+    }
+#else
+    private RespDatabaseContext TagReadContext => Context;
+#endif
+
     // the policy per-read derivations narrow from; the connection's own default when there is a
     // client cache, so the non-TimeToLive knobs survive the derivation
     private Caching.CachePolicy BaseCachePolicy
@@ -330,6 +409,27 @@ public sealed partial class RedisHybridCache
     {
         try
         {
+#if NET10_0_OR_GREATER
+            TagTicksMemo? memo = _tagMemo;
+            if (memo is not null)
+            {
+                if (memo.TryGetFreshWildcard(out long fresh))
+                {
+                    return new(fresh);
+                }
+
+                long epoch = memo.Epoch; // snapshotted BEFORE the read; see TagTicksMemo
+                ValueTask<long> pendingMemo = GetTagTicksCoreAsync(_wildcardTagKeyUtf8);
+                if (pendingMemo.IsCompletedSuccessfully)
+                {
+                    long ticks = pendingMemo.Result;
+                    memo.SetWildcard(ticks, epoch);
+                    return new(ticks);
+                }
+
+                return AwaitWildcardMemoAsync(pendingMemo, memo, epoch);
+            }
+#endif
             return FailClosedAsync(GetTagTicksCoreAsync(_wildcardTagKeyUtf8));
         }
         catch (Exception ex)
@@ -345,6 +445,15 @@ public sealed partial class RedisHybridCache
     {
         try
         {
+#if NET10_0_OR_GREATER
+            TagTicksMemo? memo = _tagMemo;
+            if (memo is not null && memo.TryGetFresh(tagUtf8.AsSpan(), out long fresh))
+            {
+                return new(fresh); // the hot path: no key render, no cache probe, no string
+            }
+
+            long epoch = memo?.Epoch ?? 0;
+#endif
             int length = TagKeyInfixUtf8.Length + tagUtf8.Count;
             byte[] rented = ArrayPool<byte>.Shared.Rent(length);
             TagKeyInfixUtf8.CopyTo(rented);
@@ -354,6 +463,19 @@ public sealed partial class RedisHybridCache
             // straight back - even when the read itself is still pending
             ValueTask<long> pending = GetTagTicksCoreAsync(rented.AsSpan(0, length));
             ArrayPool<byte>.Shared.Return(rented);
+#if NET10_0_OR_GREATER
+            if (memo is not null)
+            {
+                if (pending.IsCompletedSuccessfully)
+                {
+                    long ticks = pending.Result;
+                    memo.Set(tagUtf8.AsSpan(), ticks, epoch);
+                    return new(ticks);
+                }
+
+                return AwaitTagMemoAsync(pending, memo, tagUtf8, epoch);
+            }
+#endif
             return FailClosedAsync(pending);
         }
         catch (Exception ex)
@@ -367,6 +489,15 @@ public sealed partial class RedisHybridCache
     {
         try
         {
+#if NET10_0_OR_GREATER
+            TagTicksMemo? memo = _tagMemo;
+            if (memo is not null && memo.TryGetFresh(tag, out long fresh))
+            {
+                return new(fresh);
+            }
+
+            long epoch = memo?.Epoch ?? 0;
+#endif
             int maxLength = TagKeyInfixUtf8.Length + HybridCachePayload.Encoding.GetMaxByteCount(tag.Length);
             byte[] rented = ArrayPool<byte>.Shared.Rent(maxLength);
             TagKeyInfixUtf8.CopyTo(rented);
@@ -374,6 +505,19 @@ public sealed partial class RedisHybridCache
 
             ValueTask<long> pending = GetTagTicksCoreAsync(rented.AsSpan(0, length));
             ArrayPool<byte>.Shared.Return(rented);
+#if NET10_0_OR_GREATER
+            if (memo is not null)
+            {
+                if (pending.IsCompletedSuccessfully)
+                {
+                    long ticks = pending.Result;
+                    memo.Set(tag, ticks, epoch);
+                    return new(ticks);
+                }
+
+                return AwaitTagMemoAsync(pending, memo, tag, epoch);
+            }
+#endif
             return FailClosedAsync(pending);
         }
         catch (Exception ex)
@@ -382,10 +526,57 @@ public sealed partial class RedisHybridCache
         }
     }
 
+#if NET10_0_OR_GREATER
+    // the awaited populate paths: a fail-closed answer (long.MaxValue) is an answer, not a
+    // fact, and is never memoized - the next read retries the backend
+    private async ValueTask<long> AwaitWildcardMemoAsync(ValueTask<long> pending, TagTicksMemo memo, long epoch)
+    {
+        try
+        {
+            long ticks = await pending.ConfigureAwait(false);
+            memo.SetWildcard(ticks, epoch);
+            return ticks;
+        }
+        catch (Exception ex)
+        {
+            return FailClosedCore(ex);
+        }
+    }
+
+    private async ValueTask<long> AwaitTagMemoAsync(ValueTask<long> pending, TagTicksMemo memo, ArraySegment<byte> tagUtf8, long epoch)
+    {
+        try
+        {
+            long ticks = await pending.ConfigureAwait(false);
+            memo.Set(tagUtf8.AsSpan(), ticks, epoch);
+            return ticks;
+        }
+        catch (Exception ex)
+        {
+            return FailClosedCore(ex);
+        }
+    }
+
+    private async ValueTask<long> AwaitTagMemoAsync(ValueTask<long> pending, TagTicksMemo memo, string tag, long epoch)
+    {
+        try
+        {
+            long ticks = await pending.ConfigureAwait(false);
+            memo.Set(tag, ticks, epoch);
+            return ticks;
+        }
+        catch (Exception ex)
+        {
+            return FailClosedCore(ex);
+        }
+    }
+#endif
+
     // tag timestamps are consulted on every read of a tagged entry (the wildcard on every read);
-    // CacheOptIn makes them locally cached + push-coherent under every tracking mode
+    // CacheOptIn makes them locally cached + push-coherent under every tracking mode, and the
+    // tag context's policy (net10) arms the removal observer that keeps the tag memo honest
     private ValueTask<long> GetTagTicksCoreAsync(ReadOnlySpan<byte> tagKeyUtf8)
-        => Context.SendAsync($"{_get}{new RespKey(tagKeyUtf8)}", CommandFlags.CacheOptIn, TagTicksHandler.Instance);
+        => TagReadContext.SendAsync($"{_get}{new RespKey(tagKeyUtf8)}", CommandFlags.CacheOptIn, TagTicksHandler.Instance);
 
     private ValueTask<long> FailClosedAsync(ValueTask<long> pending)
     {
@@ -432,8 +623,34 @@ public sealed partial class RedisHybridCache
         ValueTask<bool> pending = Context.SendAsync<bool>(
             $"{_set}{new RespKey(rented.AsSpan(0, length))}{rented.AsSpan(maxLength, sizeof(long))}{(Expiration)_tagKeyLifetime}");
         ArrayPool<byte>.Shared.Return(rented);
+#if NET10_0_OR_GREATER
+        if (_tagMemo is { } memo)
+        {
+            return DropMemoAfterWriteAsync(pending, memo, tag);
+        }
+#endif
         return pending;
     }
+
+#if NET10_0_OR_GREATER
+    // Read-your-own-writes for the tag memo: the removal notification dispatches on the thread
+    // pool and can lag the very next read, but the client cache's own copy of the tag key is
+    // already invalidated (LocalWrite is synchronous with the write) - so DROP the memo entry
+    // rather than stamping it, and the next read refetches, re-arms the observer and
+    // re-populates. Stamping would leave a fresh-looking entry with no armed observer behind
+    // it. Dropped even on failure: a false miss is always safe.
+    private static async ValueTask<bool> DropMemoAfterWriteAsync(ValueTask<bool> pending, TagTicksMemo memo, string tag)
+    {
+        try
+        {
+            return await pending.ConfigureAwait(false);
+        }
+        finally
+        {
+            memo.Remove(tag);
+        }
+    }
+#endif
 
     /// <summary>
     /// Parses the raw reply ONCE into an immutable <see cref="CachedEnvelope"/> and opts it into

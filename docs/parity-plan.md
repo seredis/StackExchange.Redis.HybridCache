@@ -7,12 +7,12 @@ covered by `THIRD-PARTY-NOTICES.md`; ported files keep the .NET Foundation heade
 provenance note, as the envelope fork already does).
 
 > **Status: implemented (2026-11-10).** All thirteen gap rows and implementation-order steps
-> 1–4 are done; #13 remains track-only by design, and the two items explicitly deferred to the
-> v4 outbound-invalidation hook (tag-timestamp memoization in #7, the deserialized-object memo
-> behind the first divergence) stay deferred. The three documented divergences are asserted in
-> the ported tests. Suite at completion: 202 tests in the main project (net8.0 + net10.0,
-> against live redis) plus 6 mixed-mode byte-compat tests, all green; Release builds clean on
-> all four library TFMs.
+> 1–4 are done; #13 remains track-only by design. The two items originally deferred to the v4
+> outbound-invalidation hook **landed 2026-11-12** on SE.Redis 4.0.161-alpha: the
+> deserialized-object memo as result memoization (`IRespResultReuse` + `CachedEnvelope`,
+> issue #6 - retires the first divergence below) and tag-timestamp memoization as the direct
+> tag memo kept coherent by per-key removal notifications (`CachePolicy.RemovalHandler` +
+> `TagTicksMemo`, issue #7, net10 + client cache; downlevel answers from the client cache).
 
 Gap inventory
 ---
@@ -25,7 +25,7 @@ Gap inventory
 | 4 | **Flags** | all six honoured; flags participate in stampede key; `SetAsync` forces `DisableLocalCacheRead\|DisableDistributedCacheRead`; post-set hard flags | `DisableDistributedCacheRead/Write`, `DisableUnderlyingData` only | Port via stampede; map `DisableLocalCacheRead`/`Write` → `CommandFlags.CacheOptOut` on the GET (either flag ⇒ opt out; the read/store split is v4 candidate API #3 — until then opting out of both is the conservative mapping). `DisableCompression` accepted as reserved no-op (stock has no compression either) |
 | 5 | **Options** | `DefaultEntryOptions`, `LocalCacheExpiration`, `ReportTagMetrics`, `DisableCompression`, `DistributedCacheServiceKey` | subset | Add `ReportTagMetrics`. `LocalCacheExpiration`: **documented divergence** — local lifetime is governed by the server TTL + connection `CachePolicy`; push invalidation removes the staleness-bounding reason for short L1 TTLs (per-call max-age is a v4 candidate if demanded). Keyed-muxer convention replaces `DistributedCacheServiceKey` |
 | 6 | **Batch removes** | base-class virtuals (sequential loop) | same | Override: `KeyDeleteAsync(RedisKey[])` for keys; pipelined tag-timestamp SETs for tags — *better* than stock |
-| 7 | **Tags** | `TagSet` (0/1/N compact), validation at create, local memo + L2 read-through, `PrefetchTags` overlapping the L2 read | `string[]`, sequential GETs after parse | Port `TagSet`; prefetch wildcard+caller tags concurrently with the entry GET; reuse prefetched results for payload tags. (Memoized timestamps still gated on the v4 outbound-invalidation hook — separate work) |
+| 7 | **Tags** | `TagSet` (0/1/N compact), validation at create, local memo + L2 read-through, `PrefetchTags` overlapping the L2 read | `string[]`, sequential GETs after parse | Port `TagSet`; prefetch wildcard+caller tags concurrently with the entry GET; reuse prefetched results for payload tags. ~~(Memoized timestamps still gated on the v4 outbound-invalidation hook — separate work)~~ **Landed (2026-11-12, issue #7)**: `TagTicksMemo` fronts the client cache on net10, coherent via removal notifications; stock's foreign-invalidation flaw does not apply (`TagMemoTests`) |
 | 8 | **Post-factory tag race** | if an invalidation lands while the factory runs, bump the entry's creation timestamp (with 1-tick delay if the clock hasn't moved) so the new write isn't ambiguously invalidated | absent | Port (tag reads are CSC-local, so the check is cheap) |
 | 9 | **Logging** | `LoggerMessage`-generated, stable event IDs 1–11 | ad-hoc `ILogger` calls | Port `Log.cs` verbatim (same IDs/messages — ops familiarity) |
 | 10 | **EventSource** | `Microsoft-Extensions-HybridCache`: 16 events, polling counters | none | Port as `StackExchange-Redis-HybridCache`, same counter names (dashboards port). Mapping note: L1 hit/miss are not observable through `IDatabase` (a locally-served GET looks like any GET) — the outer GET maps to the distributed-cache events; CSC's own counters live on `GetClientCache()` |
