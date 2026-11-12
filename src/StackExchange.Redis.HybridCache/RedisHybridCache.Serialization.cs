@@ -70,6 +70,28 @@ public sealed partial class RedisHybridCache
         }
     }
 
+    /// <summary>
+    /// Serves the envelope's memoized deserialized value when it has one of the right shape;
+    /// otherwise deserializes, and offers the result back to the envelope (taken only when the
+    /// immutability conventions prove <typeparamref name="T"/> shareable - the same rule the
+    /// stampede machinery applies before sharing an instance between callers).
+    /// </summary>
+    private bool TryDeserialize<T>(CachedEnvelope envelope, ArraySegment<byte> payload, out T value)
+    {
+        if (envelope.TryGetValue(out value))
+        {
+            return true;
+        }
+
+        if (TryDeserialize(payload, out value))
+        {
+            envelope.MaybeMemoizeValue(value);
+            return true;
+        }
+
+        return false;
+    }
+
     private bool TryDeserialize<T>(ArraySegment<byte> payload, out T value)
     {
         try

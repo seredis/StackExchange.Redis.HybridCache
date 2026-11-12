@@ -180,7 +180,7 @@ public sealed partial class RedisHybridCache
                 // just been written by a completing operation
                 if ((activeFlags & HybridCacheEntryFlags.DisableDistributedCacheRead) == 0 && !_skipInitialRead)
                 {
-                    BufferChunk result;
+                    CachedEnvelope? result;
                     try
                     {
                         if (eventSourceEnabled)
@@ -191,7 +191,7 @@ public sealed partial class RedisHybridCache
                         result = await Cache.GetFromBackendAsync(Key.Key, activeFlags, _options).ConfigureAwait(false);
                         if (eventSourceEnabled)
                         {
-                            if (result.HasValue)
+                            if (result is not null)
                             {
                                 HybridCacheEventSource.Log.DistributedCacheHit();
                             }
@@ -218,21 +218,19 @@ public sealed partial class RedisHybridCache
                         }
 
                         Cache._logger.CacheUnderlyingDataQueryFailure(ex);
-                        result = default; // treat as "miss"
+                        result = null; // treat as "miss"
                     }
 
-                    if (result.HasValue
-                        && Cache.TryGetPayload(result.AsArraySegment(), Key.Key.AsSpan(), out HybridCachePayload.Parsed parsed)
+                    if (result is not null
+                        && Cache.TryGetPayload(result, Key.Key.AsSpan(), out HybridCachePayload.Parsed parsed)
                         && await Cache.AreTagsCurrentAsync(parsed.CreationTime, parsed).ConfigureAwait(false))
                     {
                         // move into the payload segment (minus any framing/header/etc data); the
-                        // backend read is a pooled rent, so ownership (and the recycle duty)
-                        // transfers with it
-                        SetResultFromBytes(new BufferChunk(parsed.Payload.Array!, parsed.Payload.Offset, parsed.Payload.Count, returnToPool: result.ReturnToPool));
+                        // segment aliases the envelope's own array, which may be shared via the
+                        // client cache's result memo - never pooled, never recycled
+                        SetResultFromBytes(new BufferChunk(parsed.Payload.Array!, parsed.Payload.Offset, parsed.Payload.Count, returnToPool: false));
                         return;
                     }
-
-                    result.RecycleIfAppropriate();
                 }
 
                 // nothing from the backend; invoke the underlying data store

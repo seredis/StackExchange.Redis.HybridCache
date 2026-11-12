@@ -57,11 +57,19 @@ Our "L1" is the client cache *inside* the GET, so:
 Divergences to assert in tests (deliberate, documented)
 ---
 
-- Immutable types are *not* reference-shared across separate `GetOrCreateAsync` calls (no
+- ~~Immutable types are *not* reference-shared across separate `GetOrCreateAsync` calls (no
   deserialized-object memo until the v4 entry-identity hook); they *are* shared among callers
-  joined to one stampede. Semantically invisible for genuinely immutable types.
+  joined to one stampede. Semantically invisible for genuinely immutable types.~~ **Retired
+  (2026-11-12, issue #6)**: the v4 hook landed as result memoization (`IRespResultReuse`,
+  SE.Redis 4.0.161-alpha). The backend handler parses the reply once into an immutable
+  `CachedEnvelope` that the client cache serves back on repeat hits (no copy, no envelope
+  re-parse), and the envelope carries a first-wins deserialized-value memo gated on the same
+  `ImmutableTypeCache<T>` conventions stock applies - so immutable `T` now shares one instance
+  across calls, matching (and on the envelope side, beating) stock. Asserted in
+  `ResultMemoTests`. Mutable `T` still deserializes per call (defensive copies), as stock does.
 - ~~`LocalCacheExpiration` is not honoured locally (see #5).~~ **Retired (2026-11-11, issue #2)**:
-  honoured via memoized `WithMaxCacheAge` read contexts when the effective local expiration
+  honoured via memoized narrowed read contexts (`WithCachePolicy` + `TimeToLive` since
+  4.0.161-alpha; previously `WithMaxCacheAge`) when the effective local expiration
   (stock resolution: `LocalCacheExpiration ?? Expiration`, per options object) is strictly
   tighter than the backend expiration; equal-or-wider bounds are already subsumed by the
   envelope's creation-based expiry check. Note the semantics remain read-time ("how stale a

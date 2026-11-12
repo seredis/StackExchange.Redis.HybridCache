@@ -242,7 +242,7 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
         // answer IS the fleet answer, and the factory events that follow tell the rest.
         bool eventSourceEnabled = HybridCacheEventSource.Log.IsEnabled();
 
-        ValueTask<BufferChunk> pendingRead;
+        ValueTask<CachedEnvelope?> pendingRead;
         try
         {
             pendingRead = GetFromBackendAsync(key, flags, options);
@@ -273,10 +273,10 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
             return AwaitBackendReadAsync(keyString ?? key.ToString(), pendingRead, state, factory, options, tags, flags, canBeCanceled, eventSourceEnabled, cancellationToken);
         }
 
-        BufferChunk blob;
+        CachedEnvelope? envelope;
         try
         {
-            blob = pendingRead.GetAwaiter().GetResult();
+            envelope = pendingRead.GetAwaiter().GetResult();
         }
         catch (Exception ex)
         {
@@ -291,23 +291,22 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
             return JoinOrCreateStampede(keyString ?? key.ToString(), state, factory, options, tags, flags, canBeCanceled, readPerformed: true, cancellationToken);
         }
 
-        if (blob.HasValue && TryGetPayload(blob.AsArraySegment(), key, out HybridCachePayload.Parsed parsed))
+        if (envelope is not null && TryGetPayload(envelope, key, out HybridCachePayload.Parsed parsed))
         {
             ValueTask<bool> tagsCurrent = AreTagsCurrentAsync(parsed.CreationTime, parsed);
             if (!tagsCurrent.IsCompletedSuccessfully)
             {
                 // a cold tag timestamp (first consult since connect); rare by construction
-                return AwaitTagsAsync(keyString ?? key.ToString(), tagsCurrent, blob, parsed.Payload, state, factory, options, tags, flags, canBeCanceled, eventSourceEnabled, cancellationToken);
+                return AwaitTagsAsync(keyString ?? key.ToString(), tagsCurrent, envelope, parsed.Payload, state, factory, options, tags, flags, canBeCanceled, eventSourceEnabled, cancellationToken);
             }
 
-            if (tagsCurrent.Result && TryDeserialize(parsed.Payload, out T value))
+            if (tagsCurrent.Result && TryDeserialize(envelope, parsed.Payload, out T value))
             {
                 if (eventSourceEnabled)
                 {
                     HybridCacheEventSource.Log.LocalCacheHit();
                 }
 
-                blob.RecycleIfAppropriate();
                 return new(value);
             }
         }
@@ -317,15 +316,13 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
             HybridCacheEventSource.Log.LocalCacheMiss();
         }
 
-        blob.RecycleIfAppropriate();
-
         // miss: join or create the shared operation for this (key, flags)
         return JoinOrCreateStampede(keyString ?? key.ToString(), state, factory, options, tags, flags, canBeCanceled, readPerformed: true, cancellationToken);
     }
 
     private async ValueTask<T> AwaitBackendReadAsync<TState, T>(
         string key,
-        ValueTask<BufferChunk> pendingRead,
+        ValueTask<CachedEnvelope?> pendingRead,
         TState state,
         Func<TState, CancellationToken, ValueTask<T>> factory,
         HybridCacheEntryOptions? options,
@@ -335,13 +332,13 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
         bool eventSourceEnabled,
         CancellationToken cancellationToken)
     {
-        BufferChunk blob = default;
+        CachedEnvelope? envelope = null;
         try
         {
-            blob = await pendingRead.ConfigureAwait(false);
+            envelope = await pendingRead.ConfigureAwait(false);
             if (eventSourceEnabled)
             {
-                if (blob.HasValue)
+                if (envelope is not null)
                 {
                     HybridCacheEventSource.Log.DistributedCacheHit();
                 }
@@ -362,24 +359,22 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
             _logger.CacheUnderlyingDataQueryFailure(ex);
         }
 
-        if (blob.HasValue && TryGetPayload(blob.AsArraySegment(), key.AsSpan(), out HybridCachePayload.Parsed parsed))
+        if (envelope is not null && TryGetPayload(envelope, key.AsSpan(), out HybridCachePayload.Parsed parsed))
         {
             if (await AreTagsCurrentAsync(parsed.CreationTime, parsed).ConfigureAwait(false)
-                && TryDeserialize(parsed.Payload, out T value))
+                && TryDeserialize(envelope, parsed.Payload, out T value))
             {
-                blob.RecycleIfAppropriate();
                 return value;
             }
         }
 
-        blob.RecycleIfAppropriate();
         return await JoinOrCreateStampede(key, state, factory, options, tags, flags, canBeCanceled, readPerformed: true, cancellationToken).ConfigureAwait(false);
     }
 
     private async ValueTask<T> AwaitTagsAsync<TState, T>(
         string key,
         ValueTask<bool> tagsCurrent,
-        BufferChunk blob,
+        CachedEnvelope envelope,
         ArraySegment<byte> payload,
         TState state,
         Func<TState, CancellationToken, ValueTask<T>> factory,
@@ -392,14 +387,13 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
     {
         // the entry itself was answered by the local cache (only a tag timestamp went remote),
         // so the local hit/miss verdict follows whether that answer is finally served
-        if (await tagsCurrent.ConfigureAwait(false) && TryDeserialize(payload, out T value))
+        if (await tagsCurrent.ConfigureAwait(false) && TryDeserialize(envelope, payload, out T value))
         {
             if (eventSourceEnabled)
             {
                 HybridCacheEventSource.Log.LocalCacheHit();
             }
 
-            blob.RecycleIfAppropriate();
             return value;
         }
 
@@ -408,7 +402,6 @@ public sealed partial class RedisHybridCache : Microsoft.Extensions.Caching.Hybr
             HybridCacheEventSource.Log.LocalCacheMiss();
         }
 
-        blob.RecycleIfAppropriate();
         return await JoinOrCreateStampede(key, state, factory, options, tags, flags, canBeCanceled, readPerformed: true, cancellationToken).ConfigureAwait(false);
     }
 

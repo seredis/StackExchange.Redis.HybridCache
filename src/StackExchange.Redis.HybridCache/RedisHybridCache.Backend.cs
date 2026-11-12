@@ -3,9 +3,10 @@
 // The redis-backend equivalents of the stock implementation's L2 + tag-invalidation partials
 // (dotnet/extensions, Internal/DefaultHybridCache.L2.cs and DefaultHybridCache.TagInvalidation.cs),
 // rebuilt over the StackExchange.Redis v4 context API (RespDatabaseContext + custom IRespHandler
-// implementations), not IDatabase: a locally-served read completes synchronously with no Task, no
-// state machine and no payload copy beyond one pooled rent, which is what makes the hit path
-// allocation-free. Entries are plain strings with PX expiry; tag-invalidation timestamps are
+// implementations), not IDatabase: a locally-served read completes synchronously with no Task and
+// no state machine, and - via result memoization (IRespResultReuse + CachedEnvelope) - a repeat
+// hit is handed the envelope already parsed, with no copy, no re-parse, and (for immutable T) no
+// re-deserialize. Entries are plain strings with PX expiry; tag-invalidation timestamps are
 // plain-string keys under the same tracked prefix, so with client-side caching enabled both are
 // locally cached and push-coherent - the stock local tag memo (and its refresh machinery) has no
 // equivalent here because the client cache *is* that memo, fleet-coherent.
@@ -151,11 +152,11 @@ public sealed partial class RedisHybridCache
     private static CommandFlags ReadCommandFlags(HybridCacheEntryFlags flags)
         => (flags & HybridCacheEntryFlags.DisableLocalCache) == 0 ? CommandFlags.CacheOptIn : CommandFlags.CacheOptOut;
 
-    internal ValueTask<BufferChunk> GetFromBackendAsync(string key, HybridCacheEntryFlags flags, HybridCacheEntryOptions? options)
-        => ReadContext(options).SendAsync($"{_get}{new RespKey(key)}", ReadCommandFlags(flags), PooledBlobHandler.Instance);
+    internal ValueTask<CachedEnvelope?> GetFromBackendAsync(string key, HybridCacheEntryFlags flags, HybridCacheEntryOptions? options)
+        => ReadContext(options).SendAsync($"{_get}{new RespKey(key)}", ReadCommandFlags(flags), EnvelopeHandler.Instance);
 
-    internal ValueTask<BufferChunk> GetFromBackendAsync(ReadOnlySpan<char> key, HybridCacheEntryFlags flags, HybridCacheEntryOptions? options)
-        => ReadContext(options).SendAsync($"{_get}{new RespKey(key)}", ReadCommandFlags(flags), PooledBlobHandler.Instance);
+    internal ValueTask<CachedEnvelope?> GetFromBackendAsync(ReadOnlySpan<char> key, HybridCacheEntryFlags flags, HybridCacheEntryOptions? options)
+        => ReadContext(options).SendAsync($"{_get}{new RespKey(key)}", ReadCommandFlags(flags), EnvelopeHandler.Instance);
 
     /// <summary>
     /// The context for an entry read: the plain context, or - when the effective
@@ -223,21 +224,35 @@ public sealed partial class RedisHybridCache
     internal ValueTask<long> DeleteBackendAsync(string key)
         => Context.SendAsync<long>($"{_unlink}{new RespKey(key)}");
 
-    private bool TryGetPayload(ArraySegment<byte> blob, ReadOnlySpan<char> key, out HybridCachePayload.Parsed parsed)
+    /// <summary>
+    /// The per-read gate over a (possibly memoized, so possibly shared) envelope: the structural
+    /// verdict was settled once at parse; what happens HERE is what genuinely varies per read -
+    /// entry expiry against the current clock, and the key echo against the reading key.
+    /// </summary>
+    private bool TryGetPayload(CachedEnvelope envelope, ReadOnlySpan<char> key, out HybridCachePayload.Parsed parsed)
     {
-        HybridCachePayload.ParseResult result = HybridCachePayload.TryParse(
-            blob, key, CurrentTimestamp(), out parsed, out Exception? fault);
-        switch (result)
+        parsed = default;
+        if (envelope.Result != HybridCachePayload.ParseResult.Success)
         {
-            case HybridCachePayload.ParseResult.Success:
-                return true;
-            case HybridCachePayload.ParseResult.ExpiredByEntry:
-                return false; // normal: redis TTL has coarser resolution than the envelope duration
-            default:
-                // foreign or damaged content, or a key-echo mismatch (colliding/case-insensitive backend)
-                _logger.CacheBackendDataRejected(result, fault);
-                return false;
+            // foreign or damaged content
+            _logger.CacheBackendDataRejected(envelope.Result, envelope.Fault);
+            return false;
         }
+
+        if (envelope.IsExpired(CurrentTimestamp()))
+        {
+            return false; // normal: redis TTL has coarser resolution than the envelope duration
+        }
+
+        if (!envelope.KeyMatches(key))
+        {
+            // a key-echo mismatch (colliding/case-insensitive backend)
+            _logger.CacheBackendDataRejected(HybridCachePayload.ParseResult.InvalidKey, null);
+            return false;
+        }
+
+        parsed = envelope.AsParsed();
+        return true;
     }
 
     /// <summary>Checks a post-factory entry against the wildcard + its tags (the "invalidation raced the factory" probe).</summary>
@@ -420,28 +435,42 @@ public sealed partial class RedisHybridCache
         return pending;
     }
 
-    /// <summary>Copies the raw reply into a pooled buffer; a nil reply is a miss (<c>default</c>).</summary>
-    private sealed class PooledBlobHandler : IRespHandler<BufferChunk>
+    /// <summary>
+    /// Parses the raw reply ONCE into an immutable <see cref="CachedEnvelope"/> and opts it into
+    /// SE.Redis result memoization (<see cref="IRespResultReuse{TResult}"/>): with client-side
+    /// caching, a repeat hit on the same entry is handed the envelope already parsed - no copy,
+    /// no re-parse - and the envelope's own value memo can then skip deserialization too. A nil
+    /// reply is a miss (<see langword="null"/>, never memoized). Damaged or foreign content
+    /// parses to a damaged envelope, also memoized: the structural parse never repeats while the
+    /// per-read rejection (and its log) still happens.
+    /// </summary>
+    private sealed class EnvelopeHandler : IRespHandler<CachedEnvelope?>, IRespResultReuse<CachedEnvelope?>
     {
-        public static readonly PooledBlobHandler Instance = new();
+        public static readonly EnvelopeHandler Instance = new();
 
-        private PooledBlobHandler()
+        private EnvelopeHandler()
         {
         }
 
-        public BufferChunk Parse(ref RespReader reader)
+        public CachedEnvelope? Parse(ref RespReader reader)
         {
             if (reader.IsNull)
             {
-                return default;
+                return null;
             }
 
+            // exact-sized and unpooled, deliberately: the envelope (and so this array) may be
+            // shared across readers for as long as the cache entry lives
             int length = reader.ScalarLength();
-            byte[] oversized = ArrayPool<byte>.Shared.Rent(Math.Max(length, 1));
-            int copied = reader.CopyTo(oversized);
+            byte[] blob = new byte[length];
+            int copied = reader.CopyTo(blob);
             Debug.Assert(copied == length, "scalar length disagreed with itself");
-            return new BufferChunk(oversized, 0, length, returnToPool: true);
+            return HybridCachePayload.ParseEnvelope(blob);
         }
+
+        public bool MayReuse(in CachedEnvelope? value) => true; // immutable by construction
+
+        public long SizeOf(in CachedEnvelope? value) => value!.Size;
     }
 
     /// <summary>Reads a tag-timestamp value in place: 8 little-endian ticks, anything else (including nil) is zero.</summary>

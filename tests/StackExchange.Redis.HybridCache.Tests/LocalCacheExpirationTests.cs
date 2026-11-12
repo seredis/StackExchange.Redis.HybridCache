@@ -1,4 +1,4 @@
-// LocalCacheExpiration, honoured via memoized WithMaxCacheAge contexts (issue #2): a locally
+// LocalCacheExpiration, honoured via memoized narrowed-TimeToLive contexts (issue #2): a locally
 // cached copy older than the effective local expiration is refetched rather than served. The
 // observable case needs an invalidation the client cache cannot see, so these tests use a
 // TrackingMode.None connection (no server-assisted invalidation) and a foreign write.

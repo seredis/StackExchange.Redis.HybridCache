@@ -47,18 +47,15 @@ internal static class HybridCachePayload
 
     internal readonly struct Parsed
     {
-        public Parsed(ArraySegment<byte> payload, TimeSpan remainingTime, long creationTime, ArraySegment<byte> tagsRegion, int tagCount)
+        public Parsed(ArraySegment<byte> payload, long creationTime, ArraySegment<byte> tagsRegion, int tagCount)
         {
             Payload = payload;
-            RemainingTime = remainingTime;
             CreationTime = creationTime;
             TagsRegion = tagsRegion;
             TagCount = tagCount;
         }
 
         public ArraySegment<byte> Payload { get; }
-
-        public TimeSpan RemainingTime { get; }
 
         public long CreationTime { get; }
 
@@ -189,24 +186,27 @@ internal static class HybridCachePayload
     }
 
     /// <summary>
-    /// Parses an envelope, validating framing, key echo and entry expiry. Tag and wildcard
-    /// expiration are NOT checked here; the caller checks <see cref="Parsed.TagsRegion"/> and
-    /// <see cref="Parsed.CreationTime"/> against the tag-timestamp keys.
+    /// Parses an envelope's structure ONCE into a <see cref="CachedEnvelope"/> - the atom that
+    /// SE.Redis result memoization shares across reads - validating framing and settling every
+    /// position (key echo, tag run, payload) and the absolute expiry. The checks that are
+    /// genuinely per-read are deliberately NOT performed here: entry expiry against the current
+    /// clock and the key-echo compare live on the envelope
+    /// (<see cref="CachedEnvelope.IsExpired"/>, <see cref="CachedEnvelope.KeyMatches"/>), and
+    /// tag/wildcard currency stays with the caller, checked against the tag-timestamp keys via
+    /// <see cref="Parsed.TagsRegion"/> and <see cref="Parsed.CreationTime"/>.
     /// </summary>
     /// <remarks>
-    /// The key is a char span rather than a string so the zero-allocation read path (interpolated
-    /// keys via the <c>ReadOnlySpan&lt;char&gt;</c> <c>GetOrCreateAsync</c> overloads) can perform
-    /// the echo check without materializing it; nothing here allocates on success.
+    /// Always returns an envelope: damaged or foreign content parses to one carrying the
+    /// rejection verdict, so the (memoized) structural parse never repeats while the per-read
+    /// rejection still logs. <paramref name="source"/> ownership transfers to the envelope - it
+    /// must be exact-sized and never pooled, because the envelope may be shared indefinitely.
     /// </remarks>
-    public static ParseResult TryParse(ArraySegment<byte> source, ReadOnlySpan<char> key, long nowTicks, out Parsed parsed, out Exception? fault)
+    public static CachedEnvelope ParseEnvelope(byte[] source)
     {
-        fault = null;
-        parsed = default;
-
-        ReadOnlySpan<byte> bytes = new(source.Array!, source.Offset, source.Count);
+        ReadOnlySpan<byte> bytes = source;
         if (bytes.Length < 19)
         {
-            return ParseResult.FormatNotRecognized;
+            return new CachedEnvelope(source, ParseResult.FormatNotRecognized, null);
         }
 
         try
@@ -218,7 +218,7 @@ internal static class HybridCachePayload
                 case UInt16SentinelPrefixPairV2:
                     break;
                 default:
-                    return ParseResult.FormatNotRecognized;
+                    return new CachedEnvelope(source, ParseResult.FormatNotRecognized, null);
             }
 
             long creationTime = BinaryPrimitives.ReadInt64LittleEndian(bytes.Slice(4)); // after 2-byte entropy
@@ -226,93 +226,99 @@ internal static class HybridCachePayload
 
             if (!TryRead7BitEncodedInt64(ref bytes, out ulong u64)) // flags
             {
-                return ParseResult.InvalidData;
+                return new CachedEnvelope(source, ParseResult.InvalidData, null);
             }
 
             uint flags = (uint)u64;
 
             if (!TryRead7BitEncodedInt64(ref bytes, out u64) || u64 > int.MaxValue) // payload length
             {
-                return ParseResult.InvalidData;
+                return new CachedEnvelope(source, ParseResult.InvalidData, null);
             }
 
             int payloadLength = (int)u64;
 
             if (!TryRead7BitEncodedInt64(ref bytes, out ulong duration))
             {
-                return ParseResult.InvalidData;
+                return new CachedEnvelope(source, ParseResult.InvalidData, null);
             }
 
-            long remainingTicks = (creationTime + (long)duration) - nowTicks;
-            if (remainingTicks <= 0)
+            // absolute expiry, saturated: a negative creation time (foreign content) can only
+            // produce an always-expired envelope, never wrap into the future
+            long expiryTime;
+            if (creationTime < 0)
             {
-                return ParseResult.ExpiredByEntry;
+                expiryTime = long.MinValue;
+            }
+            else
+            {
+                ulong total = (ulong)creationTime + duration;
+                expiryTime = total >= long.MaxValue ? long.MaxValue : (long)total;
             }
 
             if ((flags & FlagHasLocalSize) != 0)
             {
                 if (!TryRead7BitEncodedInt64(ref bytes, out _)) // local cache size: parsed, unused here
                 {
-                    return ParseResult.InvalidData;
+                    return new CachedEnvelope(source, ParseResult.InvalidData, null);
                 }
             }
 
             if (!TryRead7BitEncodedInt64(ref bytes, out u64) || u64 > int.MaxValue) // tag count
             {
-                return ParseResult.InvalidData;
+                return new CachedEnvelope(source, ParseResult.InvalidData, null);
             }
 
             int tagCount = (int)u64;
 
-            // key echo: compare as bytes (bitwise), protecting against case-misconfigured prefixes
-            // or any other way two logical keys could land on one backend key
+            // the key echo's position; the bitwise compare against the reading key is per-read
+            // (CachedEnvelope.KeyMatches), because a memoized envelope serves every reader
             if (!TryReadLengthPrefixed(ref bytes, out ReadOnlySpan<byte> keyBytes))
             {
-                return ParseResult.InvalidData;
+                return new CachedEnvelope(source, ParseResult.InvalidData, null);
             }
 
-            if (!Utf8Equals(keyBytes, key))
-            {
-                return ParseResult.InvalidKey;
-            }
+            int keyOffset = source.Length - bytes.Length - keyBytes.Length;
 
             // validate the tag run's framing now (so later walks cannot fail), but keep the tags as
             // raw bytes: the read path only ever needs them to build tag-timestamp keys
-            int tagsStart = source.Count - bytes.Length;
+            int tagsStart = source.Length - bytes.Length;
             for (int i = 0; i < tagCount; i++)
             {
                 if (!TryReadLengthPrefixed(ref bytes, out _))
                 {
-                    return ParseResult.InvalidData;
+                    return new CachedEnvelope(source, ParseResult.InvalidData, null);
                 }
             }
 
-            int tagsLength = (source.Count - bytes.Length) - tagsStart;
+            int tagsLength = (source.Length - bytes.Length) - tagsStart;
 
             if (bytes.Length != payloadLength + 2
                 || BinaryPrimitives.ReadUInt16LittleEndian(bytes.Slice(payloadLength)) != sentinel)
             {
-                return ParseResult.InvalidData;
+                return new CachedEnvelope(source, ParseResult.InvalidData, null);
             }
 
-            int start = source.Offset + source.Count - (payloadLength + 2);
-            parsed = new Parsed(
-                new ArraySegment<byte>(source.Array!, start, payloadLength),
-                new TimeSpan(remainingTicks),
+            return new CachedEnvelope(
+                source,
                 creationTime,
-                new ArraySegment<byte>(source.Array!, source.Offset + tagsStart, tagsLength),
-                tagCount);
-            return ParseResult.Success;
+                expiryTime,
+                keyOffset,
+                keyBytes.Length,
+                tagsStart,
+                tagsLength,
+                tagCount,
+                payloadOffset: source.Length - (payloadLength + 2),
+                payloadLength);
         }
         catch (Exception ex)
         {
-            fault = ex;
-            return ParseResult.ParseFault;
+            return new CachedEnvelope(source, ParseResult.ParseFault, ex);
         }
     }
 
     /// <summary>Compares UTF-8 bytes against UTF-16 text without allocating.</summary>
-    private static bool Utf8Equals(ReadOnlySpan<byte> utf8, ReadOnlySpan<char> text)
+    internal static bool Utf8Equals(ReadOnlySpan<byte> utf8, ReadOnlySpan<char> text)
     {
         if (utf8.Length > text.Length * 3)
         {
