@@ -45,7 +45,8 @@ public sealed partial class RedisHybridCache
     private int _configurationChecked;
 
     // memoized read-time freshness bounds (one derived context per distinct LocalCacheExpiration:
-    // WithMaxCacheAge allocates, and hits must not); created on first use, benign race as above
+    // deriving a policy and context allocates, and hits must not); created on first use, benign
+    // race as above
     private ConcurrentDictionary<TimeSpan, RespContext>? _maxAgeContexts;
 
     private static ReadOnlySpan<byte> TagKeyInfixUtf8 => "__SER_HCT__"u8;
@@ -53,6 +54,11 @@ public sealed partial class RedisHybridCache
     internal long CurrentTimestamp() => _clock.GetUtcNow().UtcTicks;
 
     private RespDatabaseContext Context => new(_rawContext ??= CreateRawContext());
+
+    // the policy per-read derivations narrow from; the connection's own default when there is a
+    // client cache, so the non-TimeToLive knobs survive the derivation
+    private Caching.CachePolicy BaseCachePolicy
+        => _multiplexer.GetClientCache()?.Options.DefaultPolicy ?? Caching.CachePolicy.Default;
 
     private RespContext CreateRawContext()
     {
@@ -154,7 +160,8 @@ public sealed partial class RedisHybridCache
     /// <summary>
     /// The context for an entry read: the plain context, or - when the effective
     /// <see cref="HybridCacheEntryOptions.LocalCacheExpiration"/> is strictly tighter than the
-    /// backend expiration - a memoized context bounded by <c>WithMaxCacheAge</c>, so a locally
+    /// backend expiration - a memoized context carrying a narrowed read-time policy
+    /// (<c>WithCachePolicy</c>, <c>TimeToLive</c>), so a locally
     /// cached copy older than the local expiration is refetched rather than served. The
     /// envelope's own expiry check already bounds staleness at the (creation-based, so tighter)
     /// backend expiration, which is why an equal-or-wider local bound adds nothing and takes
@@ -171,9 +178,14 @@ public sealed partial class RedisHybridCache
         ConcurrentDictionary<TimeSpan, RespContext> contexts = _maxAgeContexts ??= new();
         if (!contexts.TryGetValue(maxAge, out RespContext? context))
         {
+            // derived from the connection's default policy, not CachePolicy.Default: a per-read
+            // policy REPLACES the default for those reads, and the other knobs (removal handler,
+            // refresh, grace) must survive the narrowing. TimeToLive narrows, never widens.
+            Caching.CachePolicy policy = BaseCachePolicy with { TimeToLive = maxAge };
+
             // the value overload, not a factory lambda: GetOrAdd(key, factory) allocates the
             // delegate per call, and this runs on the hit path
-            context = contexts.GetOrAdd(maxAge, (RespContext)Context.WithMaxCacheAge(maxAge));
+            context = contexts.GetOrAdd(maxAge, (RespContext)Context.WithCachePolicy(policy));
         }
 
         return new(context);

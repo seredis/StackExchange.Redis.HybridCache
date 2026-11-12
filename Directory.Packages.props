@@ -1,7 +1,7 @@
 <Project>
   <ItemGroup>
     <!-- the client; client-side caching (CLIENT TRACKING) is v4-only -->
-    <PackageVersion Include="StackExchange.Redis" Version="4.0.155-alpha" />
+    <PackageVersion Include="StackExchange.Redis" Version="4.0.161-alpha" />
 
     <!-- the HybridCache abstract class, entry options/flags, and serializer interfaces
          all live in the abstractions package: we implement the contract without
