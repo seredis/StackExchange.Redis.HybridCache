@@ -37,14 +37,23 @@ public class ResultMemoTests : IClassFixture<RedisFixture>
         string key = "memo-imm";
         _ = await cache.GetOrCreateAsync(key, _ => new ValueTask<string>("payload"), cancellationToken: ct);
 
-        // the first read after the write is the remote fetch that populates the local cache;
-        // the reads after that are local hits served through the envelope + value memos
-        _ = await cache.GetOrCreateAsync(key, _ => new ValueTask<string>("wrong"), cancellationToken: ct);
-        string first = await cache.GetOrCreateAsync(key, _ => new ValueTask<string>("wrong"), cancellationToken: ct);
-        string second = await cache.GetOrCreateAsync(key, _ => new ValueTask<string>("wrong"), cancellationToken: ct);
+        // a remote fetch populates the local cache, but admission is not synchronous with the
+        // read that triggers it, so heat until two successive reads share an instance (the
+        // contract is that sharing is reached, not that it is reached by read N)
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (true)
+        {
+            string first = await cache.GetOrCreateAsync(key, _ => new ValueTask<string>("wrong"), cancellationToken: ct);
+            string second = await cache.GetOrCreateAsync(key, _ => new ValueTask<string>("wrong"), cancellationToken: ct);
+            Assert.Equal("payload", first);
+            if (ReferenceEquals(first, second))
+            {
+                break; // one deserialization, one instance: string is provably shareable
+            }
 
-        Assert.Equal("payload", first);
-        Assert.Same(first, second); // one deserialization, one instance: string is provably shareable
+            Assert.True(sw.ElapsedMilliseconds < 5000, $"local hits still not sharing an instance after {sw.ElapsedMilliseconds}ms");
+            await Task.Delay(50, ct);
+        }
     }
 
     [Fact]

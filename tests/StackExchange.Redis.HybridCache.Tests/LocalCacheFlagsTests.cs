@@ -32,16 +32,30 @@ public class LocalCacheFlagsTests : IClassFixture<RedisFixture>
 
     private static async Task<string> HeatAsync(HybridCacheBase cache, string key)
     {
-        // write, remote fetch that populates the local cache, then local hits; returns the
-        // memoized instance that proves subsequent serves are local (Same) or not (NotSame)
+        // write, then heat until two successive reads share an instance (admission into the
+        // local cache is not synchronous with the read that triggers it); returns the memoized
+        // instance that proves subsequent serves are local (Same) or not (NotSame)
         var ct = TestContext.Current.CancellationToken;
         _ = await cache.GetOrCreateAsync(key, _ => new ValueTask<string>("payload"), cancellationToken: ct);
-        _ = await ReadAsync(cache, key);
-        string first = await ReadAsync(cache, key);
-        string second = await ReadAsync(cache, key);
-        Assert.Equal("payload", first);
-        Assert.Same(first, second); // baseline: the memo is engaged and serving locally
-        return first;
+        return await AssertEventuallySharedAsync(cache, key);
+    }
+
+    private static async Task<string> AssertEventuallySharedAsync(HybridCacheBase cache, string key)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (true)
+        {
+            string first = await ReadAsync(cache, key);
+            string second = await ReadAsync(cache, key);
+            Assert.Equal("payload", first);
+            if (ReferenceEquals(first, second))
+            {
+                return first; // the memo is engaged and serving locally
+            }
+
+            Assert.True(sw.ElapsedMilliseconds < 5000, $"local hits still not sharing an instance after {sw.ElapsedMilliseconds}ms");
+            await Task.Delay(50, TestContext.Current.CancellationToken);
+        }
     }
 
     private static ValueTask<string> ReadAsync(HybridCacheBase cache, string key, HybridCacheEntryOptions? options = null)
@@ -86,10 +100,7 @@ public class LocalCacheFlagsTests : IClassFixture<RedisFixture>
         Assert.NotSame(first, second);
 
         // plain reads still populate and serve as usual afterwards
-        _ = await ReadAsync(cache, "nlw");
-        string a = await ReadAsync(cache, "nlw");
-        string b = await ReadAsync(cache, "nlw");
-        Assert.Same(a, b);
+        _ = await AssertEventuallySharedAsync(cache, "nlw");
     }
 
     [Fact]
