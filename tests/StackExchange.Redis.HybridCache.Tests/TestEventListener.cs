@@ -24,6 +24,7 @@ public sealed class TestEventListener : EventListener
     private const double EventCounterIntervalSec = 0.25;
 
     private readonly List<(int id, string name, EventLevel level)> _events = [];
+    private readonly List<string> _sourceMessages = [];
     private readonly Dictionary<string, (string? displayName, double value)> _counters = [];
 
     private object SyncLock => _events;
@@ -117,6 +118,12 @@ public sealed class TestEventListener : EventListener
                 else
                 {
                     _events.Add((eventData.EventId, eventData.EventName ?? "", eventData.Level));
+                    if (eventData.EventId == 0)
+                    {
+                        // "EventSourceMessage": the source reporting its own internal failure;
+                        // keep the text so an assert can say WHY instead of just "wrong event"
+                        _sourceMessages.Add(string.Join("; ", eventData.Payload ?? (IReadOnlyList<object?>)[]));
+                    }
                 }
             }
         }
@@ -138,6 +145,14 @@ public sealed class TestEventListener : EventListener
     public void AssertSingleEvent(int id, string name, EventLevel level)
     {
         var evt = SingleEvent();
+        if (evt.name == "EventSourceMessage" && name != "EventSourceMessage")
+        {
+            lock (SyncLock)
+            {
+                Assert.Fail($"the event source reported an internal failure instead of {name}: {string.Join(" | ", _sourceMessages)}");
+            }
+        }
+
         Assert.Equal(name, evt.name);
         Assert.Equal(id, evt.id);
         Assert.Equal(level, evt.level);
