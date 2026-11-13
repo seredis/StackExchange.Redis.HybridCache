@@ -226,10 +226,15 @@ public sealed partial class RedisHybridCache
 
     // CacheOptIn: being a HybridCache entry *is* the admission decision - force first-miss
     // admission (and reach) under every tracking mode, not just TrackingByPrefix. The local
-    // flags map to CacheOptOut: the read/store suppression split is not expressible per-call
-    // today (candidate SE.Redis API; see docs/design.md), so either local flag opts out of both.
+    // flags map exactly (SE.Redis 4.0.165-alpha): DisableLocalCacheRead → CacheNoLocalServe
+    // (always a round trip, but the reply stays eligible to store and enrollment still arms)
+    // and DisableLocalCacheWrite → CacheNoLocalStore (an entry already present may still be
+    // served - serving is not storing - but a round-trip reply is never admitted). Both
+    // together = full non-participation for that call. The HC bits sit at 0-1 and the
+    // SE.Redis bits at 23-24 by design, so the mapping is a single shift.
     private static CommandFlags ReadCommandFlags(HybridCacheEntryFlags flags)
-        => (flags & HybridCacheEntryFlags.DisableLocalCache) == 0 ? CommandFlags.CacheOptIn : CommandFlags.CacheOptOut;
+        => CommandFlags.CacheOptIn
+            | (CommandFlags)((int)(flags & HybridCacheEntryFlags.DisableLocalCache) << 23);
 
     internal ValueTask<CachedEnvelope?> GetFromBackendAsync(string key, HybridCacheEntryFlags flags, HybridCacheEntryOptions? options)
         => ReadContext(options).SendAsync($"{_get}{new RespKey(key)}", ReadCommandFlags(flags), EnvelopeHandler.Instance);

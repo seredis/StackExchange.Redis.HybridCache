@@ -283,8 +283,8 @@ only the stock stack). Findings, all asserted by tests:
 |---|---|
 | `Expiration` | redis TTL on the stored entry (`SET ... PX`). The source of truth; shared by the fleet. |
 | `LocalCacheExpiration` | CSC bound: per-read `WithMaxCacheAge(localExpiration)` context (can only tighten the cache-wide `TimeToLive`). Cache-wide default comes from `CachePolicy.TimeToLive`. Note semantics shift: stock = "how long L1 keeps it"; here = "how stale a near-copy I will accept", with push invalidation making the practical staleness far smaller. |
-| `DisableLocalCacheRead` | `CommandFlags.CacheOptOut` on the GET (note: also skips storing; CSC cannot currently express "don't read the cache but do store the reply" — acceptable, flag as SE.Redis nice-to-have). |
-| `DisableLocalCacheWrite` | `CacheOptOut` likewise (same caveat, mirrored). |
+| `DisableLocalCacheRead` | `CommandFlags.CacheNoLocalServe` on the GET (SE.Redis 4.0.165-alpha): always a round trip, but the reply stays eligible to store and invalidation enrollment still arms. Exact stock semantics. |
+| `DisableLocalCacheWrite` | `CommandFlags.CacheNoLocalStore`: an entry already present may still be served (serving is not storing), but a round-trip reply is never admitted. Both flags together = full non-participation for that call. The HC bits (0–1) shift directly onto the SE.Redis bits (23–24). |
 | `DisableDistributedCacheRead/Write` | Skip the redis GET / SET; with both disabled SE.Hybrid degrades to stampede-protection-only, same as stock. |
 | `DisableUnderlyingData` | Skip the factory; return default on miss. |
 | `DisableCompression` | Honour if/when payload compression is forked. |
@@ -326,8 +326,10 @@ caching API. Current list:
    timestamps dropped on push (removing the N+1 per-read tag GETs) and active eviction of
    tagged entries (see Tags section). A narrow shape would do: registration filtered to exact
    keys we name, fired off the reader path.
-3. *(nice-to-have)* Split `CacheOptOut` into read-suppression vs store-suppression for the
-   `DisableLocalCacheRead/Write` flags' exact semantics.
+3. ~~*(nice-to-have)* Split `CacheOptOut` into read-suppression vs store-suppression for the
+   `DisableLocalCacheRead/Write` flags' exact semantics.~~ **Landed (2026-11-13,
+   4.0.165-alpha)**: `CacheNoLocalServe` / `CacheNoLocalStore` per-command flags (bits 23–24,
+   mirroring the HC flag bits 0–1), adopted in issue #5.
 4. *(check, probably exists)* Per-call read returning a lease over the payload without copy
    (`ReadOnlyLease<T>` is documented for cache hits — confirm the exact string/GET shape).
 
