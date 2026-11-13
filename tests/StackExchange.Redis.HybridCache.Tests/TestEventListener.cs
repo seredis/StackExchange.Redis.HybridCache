@@ -25,6 +25,18 @@ public sealed class TestEventListener : EventListener
 
     private readonly List<(int id, string name, EventLevel level)> _events = [];
     private readonly List<string> _sourceMessages = [];
+
+    // deliberately NOT cleared by Reset(): enable-time failures happen once, before any test
+    public IReadOnlyList<string> SourceMessages
+    {
+        get
+        {
+            lock (SyncLock)
+            {
+                return [.. _sourceMessages];
+            }
+        }
+    }
     private readonly Dictionary<string, (string? displayName, double value)> _counters = [];
 
     private object SyncLock => _events;
