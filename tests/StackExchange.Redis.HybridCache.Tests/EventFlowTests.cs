@@ -1,9 +1,8 @@
 // End-to-end event emission from real cache operations (issue #3): a read answered by the local
 // cache (synchronous completion) is LocalCacheHit; a round trip is LocalCacheMiss + the
-// distributed events. The EventSource is process-global and other test classes run in parallel
-// (their caches also emit while we listen), so these assertions are positive-only: the expected
-// events must appear, and foreign events are tolerated. The zero-alloc tests skip themselves
-// while any listener is active, so enabling one here is safe.
+// distributed events. The EventSource is process-global, so these tests run in the serialized
+// EventSource collection (no other tests execute while we listen); the assertions stay
+// positive-only - the expected events must appear, stragglers are tolerated.
 
 using System;
 using System.Collections.Concurrent;
@@ -18,6 +17,7 @@ using HybridCacheBase = Microsoft.Extensions.Caching.Hybrid.HybridCache;
 
 namespace StackExchange.Redis.HybridCache.Tests;
 
+[Collection(nameof(EventSourceCollection))]
 public class EventFlowTests : IClassFixture<RedisFixture>
 {
     private readonly RedisFixture _fx;
@@ -31,12 +31,10 @@ public class EventFlowTests : IClassFixture<RedisFixture>
 
         using var listener = new FlowListener();
 
-        // Only one EventSource instance can own a name: a second same-named instance cannot be
-        // enabled at all (verified standalone). HybridCacheEventSourceTests' fixture creates a
-        // private same-named instance, so in a full parallel run whichever is constructed second
-        // is inert - when the live Log lost that race, this test cannot observe anything and
-        // skips. It runs fully in isolation (and in runs where the live source wins the name).
-        Assert.SkipWhen(!HybridCacheEventSource.Log.IsEnabled(), "another HybridCacheEventSource instance owns the source name in this process");
+        // Only one EventSource instance owns a name, and since issue #14 the process has only
+        // one (the Log singleton; TestEventListener listens to it rather than to a private
+        // same-named instance), so this enable must stick - failure here is a real bug
+        Assert.True(HybridCacheEventSource.Log.IsEnabled(), "the process-global event source failed to enable");
 
         await using var provider = new ServiceCollection()
             .AddSingleton<IConnectionMultiplexer>(_fx.CachedConnection!)
@@ -77,8 +75,7 @@ public class EventFlowTests : IClassFixture<RedisFixture>
         {
             // by name: this can fire from inside the Log field's own static initializer, when
             // HybridCacheEventSource.Log is still null (so a ReferenceEquals check never
-            // matches). TestEventListener's private same-named instance gets enabled too, which
-            // is harmless: OnEventWritten filters to the live instance, by then initialized.
+            // matches); OnEventWritten filters to the singleton, by then initialized.
             if (eventSource.Name == "StackExchange-Redis-HybridCache")
             {
                 EnableEvents(eventSource, EventLevel.LogAlways);

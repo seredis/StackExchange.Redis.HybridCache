@@ -21,6 +21,14 @@ public sealed class TestEventListener : EventListener
     // this is used as a class fixture from HybridCacheEventSourceTests, because there
     // seems to be some unpredictable behaviours if multiple event sources/listeners are
     // casually created etc
+    //
+    // CRITICALLY, it listens to the product singleton rather than a private same-named
+    // instance (the stock test suite's arrangement): EventSource name/GUID is per-class, so a
+    // second instance is a duplicate registration, and whichever instance is constructed
+    // second is at best inert and at worst poisoned (construction error reported at enable
+    // time, then NullReferenceException on every write - see issue #14, where test-order
+    // changes made CI trip over exactly that). One instance, zero races; the serialized
+    // EventSource test collection keeps other tests' cache traffic out of the listening window.
     private const double EventCounterIntervalSec = 0.25;
 
     private readonly List<(int id, string name, EventLevel level)> _events = [];
@@ -41,7 +49,7 @@ public sealed class TestEventListener : EventListener
 
     private object SyncLock => _events;
 
-    internal HybridCacheEventSource Source { get; } = new();
+    internal HybridCacheEventSource Source => HybridCacheEventSource.Log;
 
     public TestEventListener Reset(bool resetCounters = true)
     {
@@ -63,21 +71,27 @@ public sealed class TestEventListener : EventListener
 
     protected override void OnEventSourceCreated(EventSource eventSource)
     {
-        if (ReferenceEquals(eventSource, Source))
+        // by NAME, not ReferenceEquals against the singleton: this callback can fire from
+        // inside the Log field's own static initializer, when the field is still null
+        if (eventSource.Name == "StackExchange-Redis-HybridCache")
         {
             var args = new Dictionary<string, string?>
             {
                 ["EventCounterIntervalSec"] = EventCounterIntervalSec.ToString("G", CultureInfo.InvariantCulture),
             };
-            EnableEvents(Source, EventLevel.LogAlways, EventKeywords.All, args);
+            EnableEvents(eventSource, EventLevel.LogAlways, EventKeywords.All, args);
         }
 
         base.OnEventSourceCreated(eventSource);
     }
 
+    public TestEventListener() => _ = Source.IsEnabled(); // force the singleton (and so its enable) to exist now
+
     protected override void OnEventWritten(EventWrittenEventArgs eventData)
     {
-        if (ReferenceEquals(eventData.EventSource, Source))
+        // name-match for the same reason as OnEventSourceCreated: an enable-time error event
+        // can arrive while the singleton's own static initializer is still running
+        if (eventData.EventSource.Name == "StackExchange-Redis-HybridCache")
         {
             // capture counters/events
             lock (SyncLock)

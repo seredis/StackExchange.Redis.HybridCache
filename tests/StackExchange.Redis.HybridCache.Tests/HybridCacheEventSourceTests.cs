@@ -13,9 +13,12 @@ using Xunit;
 
 namespace StackExchange.Redis.HybridCache.Tests;
 
+[Collection(nameof(EventSourceCollection))]
 public class HybridCacheEventSourceTests(ITestOutputHelper log, TestEventListener listener) : IClassFixture<TestEventListener>
 {
-    // see notes in TestEventListener for context on fixture usage
+    // see notes in TestEventListener for context on fixture usage; the collection serializes
+    // these tests against the rest of the suite, because the listener observes the
+    // process-global source that every cache operation emits into
 
     [Fact]
     public void MatchesNameAndGuid()
