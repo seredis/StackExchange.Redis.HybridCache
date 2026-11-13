@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04 # pinned: ubuntu-26.04 breaks duplicate-GUID EventSource registration (see issue #14)
+    runs-on: ubuntu-26.04 # temporarily pinned FORWARD to verify the #14 fix on the new image; then back to ubuntu-latest
     services:
       redis:
         image: redis:8
